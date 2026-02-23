@@ -2,7 +2,7 @@
 .report-container { max-width: 1000px; margin: 0 auto; display: flex; flex-direction: column; gap: 24px; }
 
 /* LOADING */
-.report-loading { min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+.report-loading { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 24px; }
 .report-loading-inner { display: flex; flex-direction: column; align-items: center; gap: 24px; text-align: center; }
 .report-loading-text { display: flex; flex-direction: column; gap: 8px; }
 
@@ -17,10 +17,7 @@
 
 /* SCORE CARDS */
 .score-cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--border); border: 1px solid var(--border); }
-.score-card {
-  background: var(--surface); padding: 24px 20px;
-  display: flex; flex-direction: column; gap: 4px;
-}
+.score-card { background: var(--surface); padding: 24px 20px; display: flex; flex-direction: column; gap: 4px; }
 .score-card-label { font-family: var(--mono); font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-muted); margin-bottom: 8px; }
 .score-card-val { font-family: var(--display); font-size: 36px; font-weight: 700; line-height: 1; }
 .score-card-max { font-family: var(--mono); font-size: 11px; color: var(--text-muted); }
@@ -30,32 +27,105 @@
 .score-card-readiness .score-card-val { font-size: 22px; margin-top: 4px; }
 
 /* SECTION CARDS */
-.report-section-card {
-  background: var(--surface); border: 1px solid var(--border); padding: 32px;
-}
-.rsc-label {
-  font-family: var(--mono); font-size: 10px; letter-spacing: 0.12em;
-  text-transform: uppercase; color: var(--accent); margin-bottom: 20px;
-}
+.report-section-card { background: var(--surface); border: 1px solid var(--border); padding: 32px; }
+.rsc-label { font-family: var(--mono); font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent); margin-bottom: 20px; }
 
 /* WEAKNESSES */
 .weakness-list { display: flex; flex-direction: column; gap: 0; }
-.weakness-row {
-  padding: 14px 0; border-bottom: 1px solid rgba(255,255,255,0.04);
-  display: flex; flex-direction: column; gap: 6px;
-}
+.weakness-row { padding: 14px 0; border-bottom: 1px solid rgba(255,255,255,0.04); display: flex; flex-direction: column; gap: 6px; }
 .weakness-row:last-child { border-bottom: none; }
 .weakness-left { display: flex; align-items: center; gap: 10px; }
-.severity-badge {
-  font-family: var(--mono); font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; padding: 2px 8px; border: 1px solid; flex-shrink: 0;
-}
+.severity-badge { font-family: var(--mono); font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; padding: 2px 8px; border: 1px solid; flex-shrink: 0; }
 .severity-badge.high { color: var(--red); border-color: rgba(248,113,113,0.4); background: var(--red-dim); }
 .severity-badge.medium { color: var(--accent); border-color: rgba(232,168,56,0.4); background: var(--accent-dim); }
 .weakness-text { font-size: 14px; color: var(--text); }
 .weakness-improvement { font-size: 13px; color: var(--text-dim); padding-left: 60px; font-style: italic; }
 
-/* REPORT TEXT */
-.report-text { font-size: 14px; color: var(--text-dim); line-height: 1.8; font-weight: 300; }
+/* ── REPORT TEXT MARKDOWN STYLES ── */
+.report-text { display: flex; flex-direction: column; }
+
+.report-h1 {
+  font-family: var(--display);
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text);
+  margin: 28px 0 14px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+.report-h1:first-child { margin-top: 0; }
+
+.report-h2 {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin: 24px 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.report-h2::before {
+  content: '';
+  width: 16px;
+  height: 1px;
+  background: var(--accent);
+  flex-shrink: 0;
+}
+
+.report-divider {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 20px 0;
+}
+
+.report-para {
+  font-size: 14px;
+  color: var(--text-dim);
+  line-height: 1.85;
+  font-weight: 300;
+  margin-bottom: 10px;
+}
+
+.report-list-item {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+  margin-bottom: 12px;
+  padding: 16px 20px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+}
+
+.report-list-num {
+  font-family: var(--display);
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--accent);
+  flex-shrink: 0;
+  line-height: 1.2;
+  min-width: 20px;
+}
+
+.report-bullet {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  font-size: 14px;
+  color: var(--text-dim);
+  line-height: 1.7;
+  margin-bottom: 6px;
+  padding-left: 4px;
+}
+
+.report-bullet-dot {
+  color: var(--accent);
+  font-size: 18px;
+  flex-shrink: 0;
+  line-height: 1;
+}
 
 /* ACTIONS */
 .report-actions { display: flex; gap: 16px; padding-top: 8px; }
@@ -65,6 +135,7 @@
   .report-top { flex-direction: column; gap: 24px; align-items: flex-start; }
   .score-cards { grid-template-columns: 1fr 1fr; }
   .weakness-improvement { padding-left: 0; }
+  .report-list-item { flex-direction: column; gap: 8px; }
 }
 @media (max-width: 600px) {
   .score-cards { grid-template-columns: 1fr; }

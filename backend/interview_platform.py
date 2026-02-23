@@ -259,164 +259,165 @@ class QdrantManager:
 
 class Neo4jManager:
     """Manages Neo4j graph database operations"""
-    
+
     def __init__(self):
         print("NEO4J_URI:", Config.NEO4J_URI)
-        self.auth = (Config.NEO4J_USER, Config.NEO4J_PASSWORD)
         self.uri = Config.NEO4J_URI
-        self.driver = GraphDatabase.driver(
+        self.auth = (Config.NEO4J_USER, Config.NEO4J_PASSWORD)
+        self._setup_constraints()
+
+    def _new_driver(self):
+        """Always create a brand new driver — never reuse stale connections."""
+        return GraphDatabase.driver(
             self.uri,
             auth=self.auth,
-            max_connection_lifetime=200,      # refresh connections every 200s
-            keep_alive=True,
+            max_connection_lifetime=100,
             connection_timeout=30,
         )
-        self._setup_constraints()
+
     def _get_session(self):
-        try:
-            self.driver.verify_connectivity()
-        except Exception:
-            # Reconnect if driver went stale, then fall through
-            try:
-                self.driver.close()
-            except Exception:
-                pass
-            self.driver = GraphDatabase.driver(
-                self.uri,
-                auth=self.auth,
-                max_connection_lifetime=200,
-                keep_alive=True,
-                connection_timeout=30,
-            )
-        return self.driver.session()  # ← just return the session directly
-    
-    
+        """Return a session from a fresh driver. Caller must close the driver."""
+        return self._new_driver().session()
+
     def close(self):
-        self.driver.close()
-    
+        pass  # Nothing to close — drivers are created fresh per operation
+
     def _setup_constraints(self):
-        """Create constraints and indexes"""
-        with self._get_session() as session:
-            # Create constraints
-            session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (u:User) REQUIRE u.session_id IS UNIQUE")
-            session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (s:Skill) REQUIRE s.name IS UNIQUE")
-    
+        driver = self._new_driver()
+        try:
+            with driver.session() as session:
+                session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (u:User) REQUIRE u.session_id IS UNIQUE")
+                session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (s:Skill) REQUIRE s.name IS UNIQUE")
+        finally:
+            driver.close()
+
     def create_user_session(self, session_id: str, resume_data: Dict[str, Any]):
-        """Create user node and skills"""
-        with self._get_session() as session:
-            # Create user
-            session.run(
-                "CREATE (u:User {session_id: $session_id, created_at: datetime()})",
-                session_id=session_id
-            )
-            
-            # Create skills and relationships
-            for skill in resume_data.get("skills", []):
-                session.run("""
-                    MERGE (s:Skill {name: $skill})
-                    WITH s
-                    MATCH (u:User {session_id: $session_id})
-                    CREATE (u)-[:HAS_SKILL {proficiency: 0.7}]->(s)
-                """, skill=skill, session_id=session_id)
-    
-    def create_jd_requirements(self, session_id: str, jd_requirements: Dict[str, Any]):
-        """Create JD requirements and link to skills"""
-        with self._get_session() as session:
-            for skill in jd_requirements.get("required_skills", []):
-                session.run("""
-                    MERGE (s:Skill {name: $skill})
-                    WITH s
-                    MATCH (u:User {session_id: $session_id})
-                    MERGE (r:Requirement {session_id: $session_id, skill: $skill, priority: 'high'})
-                    CREATE (r)-[:REQUIRES]->(s)
-                    CREATE (u)-[:TARGETS]->(r)
-                """, skill=skill, session_id=session_id)
-    
-    def store_qa_evaluation(self, session_id: str, qa_data: Dict[str, Any]):
-        """Store question-answer evaluation"""
-        with self._get_session() as session:
-            session.run("""
-                MATCH (u:User {session_id: $session_id})
-                CREATE (q:Question {
-                    id: $qa_id,
-                    text: $question,
-                    asked_at: datetime()
-                })
-                CREATE (a:Answer {
-                    text: $answer,
-                    technical_score: $technical_score,
-                    clarity_score: $clarity_score,
-                    confidence_score: $confidence_score,
-                    overall_score: $overall_score
-                })
-                CREATE (u)-[:ASKED]->(q)
-                CREATE (q)-[:ANSWERED_BY]->(a)
-            """, 
-                session_id=session_id,
-                qa_id=qa_data["question_id"],
-                question=qa_data["question"],
-                answer=qa_data["answer"],
-                technical_score=qa_data["technical_score"],
-                clarity_score=qa_data["clarity_score"],
-                confidence_score=qa_data["confidence_score"],
-                overall_score=qa_data["overall_score"]
-            )
-            
-            # If score is low, create weakness node
-            if qa_data["overall_score"] < 3.0:
-                session.run("""
-                    MATCH (a:Answer)<-[:ANSWERED_BY]-(q:Question {id: $qa_id})
-                    CREATE (w:Weakness {
-                        area: $feedback,
-                        severity: $severity
-                    })
-                    CREATE (a)-[:REVEALS]->(w)
-                    CREATE (w)-[:SUGGESTS]->(i:Improvement {
-                        recommendation: $recommendation
-                    })
-                """,
-                    qa_id=qa_data["question_id"],
-                    feedback=qa_data.get("feedback", "Needs improvement"),
-                    severity="high" if qa_data["overall_score"] < 2.0 else "medium",
-                    recommendation="Practice this topic more"
+        driver = self._new_driver()
+        try:
+            with driver.session() as session:
+                session.run(
+                    "CREATE (u:User {session_id: $session_id, created_at: datetime()})",
+                    session_id=session_id
                 )
+                for skill in resume_data.get("skills", []):
+                    session.run("""
+                        MERGE (s:Skill {name: $skill})
+                        WITH s
+                        MATCH (u:User {session_id: $session_id})
+                        CREATE (u)-[:HAS_SKILL {proficiency: 0.7}]->(s)
+                    """, skill=skill, session_id=session_id)
+        finally:
+            driver.close()
+
+    def create_jd_requirements(self, session_id: str, jd_requirements: Dict[str, Any]):
+        driver = self._new_driver()
+        try:
+            with driver.session() as session:
+                for skill in jd_requirements.get("required_skills", []):
+                    session.run("""
+                        MERGE (s:Skill {name: $skill})
+                        WITH s
+                        MATCH (u:User {session_id: $session_id})
+                        MERGE (r:Requirement {session_id: $session_id, skill: $skill, priority: 'high'})
+                        CREATE (r)-[:REQUIRES]->(s)
+                        CREATE (u)-[:TARGETS]->(r)
+                    """, skill=skill, session_id=session_id)
+        finally:
+            driver.close()
+
+    def store_qa_evaluation(self, session_id: str, qa_data: Dict[str, Any]):
+        driver = self._new_driver()
+        try:
+            with driver.session() as session:
+                session.run("""
+                    MATCH (u:User {session_id: $session_id})
+                    CREATE (q:Question {id: $qa_id, text: $question, asked_at: datetime()})
+                    CREATE (a:Answer {
+                        text: $answer,
+                        technical_score: $technical_score,
+                        clarity_score: $clarity_score,
+                        confidence_score: $confidence_score,
+                        overall_score: $overall_score
+                    })
+                    CREATE (u)-[:ASKED]->(q)
+                    CREATE (q)-[:ANSWERED_BY]->(a)
+                """,
+                    session_id=session_id,
+                    qa_id=qa_data["question_id"],
+                    question=qa_data["question"],
+                    answer=qa_data["answer"],
+                    technical_score=qa_data["technical_score"],
+                    clarity_score=qa_data["clarity_score"],
+                    confidence_score=qa_data["confidence_score"],
+                    overall_score=qa_data["overall_score"]
+                )
+                if qa_data["overall_score"] < 3.0:
+                    # Use the actual question as the weakness area, not the generic feedback
+                    weakness_area = qa_data.get("question", "Unknown topic")[:200]
     
+                    # Build a specific recommendation based on score
+                    score = qa_data["overall_score"]
+                    if score <= 1.0:
+                        recommendation = f"No answer provided. Study this topic from scratch: '{weakness_area[:80]}'"
+                    elif score < 2.0:
+                        recommendation = f"Very weak answer. Deep dive into: '{weakness_area[:80]}'"
+                    else:
+                        recommendation = f"Partial understanding. Revisit and practice: '{weakness_area[:80]}'"
+
+                    session.run("""
+                        MATCH (a:Answer)<-[:ANSWERED_BY]-(q:Question {id: $qa_id})
+                        CREATE (w:Weakness {area: $weakness_area, severity: $severity})
+                        CREATE (a)-[:REVEALS]->(w)
+                        CREATE (w)-[:SUGGESTS]->(i:Improvement {recommendation: $recommendation})
+                    """,
+                    qa_id=qa_data["question_id"],
+                    weakness_area=weakness_area,
+                    severity="high" if score < 2.0 else "medium",
+                    recommendation=recommendation
+                )
+        finally:
+            driver.close()
+
     def get_performance_summary(self, session_id: str) -> Dict[str, Any]:
-        """Get overall performance metrics"""
-        with self._get_session() as session:
-            result = session.run("""
-                MATCH (u:User {session_id: $session_id})-[:ASKED]->(q:Question)-[:ANSWERED_BY]->(a:Answer)
-                RETURN 
-                    AVG(a.technical_score) as avg_technical,
-                    AVG(a.clarity_score) as avg_clarity,
-                    AVG(a.confidence_score) as avg_confidence,
-                    AVG(a.overall_score) as avg_overall,
-                    COUNT(a) as total_questions
-            """, session_id=session_id)
-            
-            record = result.single()
-            if record:
-                return {
-                    "avg_technical": round(record["avg_technical"], 2),
-                    "avg_clarity": round(record["avg_clarity"], 2),
-                    "avg_confidence": round(record["avg_confidence"], 2),
-                    "avg_overall": round(record["avg_overall"], 2),
-                    "total_questions": record["total_questions"]
-                }
-            return {}
-    
+        driver = self._new_driver()
+        try:
+            with driver.session() as session:
+                result = session.run("""
+                    MATCH (u:User {session_id: $session_id})-[:ASKED]->(q:Question)-[:ANSWERED_BY]->(a:Answer)
+                    RETURN
+                        AVG(a.technical_score) as avg_technical,
+                        AVG(a.clarity_score) as avg_clarity,
+                        AVG(a.confidence_score) as avg_confidence,
+                        AVG(a.overall_score) as avg_overall,
+                        COUNT(a) as total_questions
+                """, session_id=session_id)
+                record = result.single()
+                if record:
+                    return {
+                        "avg_technical": round(record["avg_technical"] or 0, 2),
+                        "avg_clarity": round(record["avg_clarity"] or 0, 2),
+                        "avg_confidence": round(record["avg_confidence"] or 0, 2),
+                        "avg_overall": round(record["avg_overall"] or 0, 2),
+                        "total_questions": record["total_questions"]
+                    }
+                return {}
+        finally:
+            driver.close()
+
     def get_weaknesses_and_improvements(self, session_id: str) -> List[Dict[str, str]]:
-        """Get identified weaknesses with improvement suggestions"""
-        with self._get_session() as session:
-            result = session.run("""
-                MATCH (u:User {session_id: $session_id})-[:ASKED]->(:Question)-[:ANSWERED_BY]->(:Answer)-[:REVEALS]->(w:Weakness)
-                MATCH (w)-[:SUGGESTS]->(i:Improvement)
-                RETURN w.area as weakness, w.severity as severity, i.recommendation as improvement
-                ORDER BY w.severity DESC
-            """, session_id=session_id)
-            
-            return [{"weakness": r["weakness"], "severity": r["severity"], "improvement": r["improvement"]} 
-                    for r in result]
+        driver = self._new_driver()
+        try:
+            with driver.session() as session:
+                result = session.run("""
+                    MATCH (u:User {session_id: $session_id})-[:ASKED]->(:Question)-[:ANSWERED_BY]->(:Answer)-[:REVEALS]->(w:Weakness)
+                    MATCH (w)-[:SUGGESTS]->(i:Improvement)
+                    RETURN w.area as weakness, w.severity as severity, i.recommendation as improvement
+                    ORDER BY w.severity DESC
+                """, session_id=session_id)
+                return [{"weakness": r["weakness"], "severity": r["severity"], "improvement": r["improvement"]}
+                        for r in result]
+        finally:
+            driver.close()
 
 # ===================================================================
 # PARSERS
