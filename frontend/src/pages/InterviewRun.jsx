@@ -13,6 +13,8 @@ export default function InterviewRun() {
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
   const [qaHistory, setQaHistory] = useState([])
+  const [showConfirm, setShowConfirm] = useState(false)   // ← fix 2: confirmation dialog
+  const [pendingAnswer, setPendingAnswer] = useState('')
   const textareaRef = useRef(null)
 
   useEffect(() => {
@@ -38,34 +40,50 @@ export default function InterviewRun() {
     }
   }
 
-  const handleSubmit = async (overrideAnswer) => {
+  // ── Step 1: User clicks Submit → show confirmation dialog ────────
+  const handleSubmitClick = (overrideAnswer) => {
     const finalAnswer = overrideAnswer ?? answer.trim()
     if (!finalAnswer) {
       textareaRef.current?.focus()
       return
     }
+    setPendingAnswer(finalAnswer)
+    setShowConfirm(true)
+  }
+
+  // ── Step 2a: User confirms → actually submit ─────────────────────
+  const handleConfirm = async () => {
+    setShowConfirm(false)
     setSubmitting(true)
     setError('')
     try {
-      const result = await submitAnswer(session.session_id, finalAnswer)
+      const result = await submitAnswer(session.session_id, pendingAnswer)
       setEvaluation(result)
-      setQaHistory(prev => [...prev, {
-        question: question.question,
-        answer: finalAnswer,
-        ...result,
-      }])
+      const newEntry = { question: question.question, answer: pendingAnswer, ...result }
+      setQaHistory(prev => [...prev, newEntry])
       if (result.interview_complete) {
-        sessionStorage.setItem('qaHistory', JSON.stringify([...qaHistory, { question: question.question, answer: finalAnswer, ...result }]))
+        sessionStorage.setItem('qaHistory', JSON.stringify([...qaHistory, newEntry]))
         setTimeout(() => navigate('/interview/report'), 1200)
       }
     } catch (err) {
-      setError('Failed to submit answer.')
+      setError('Failed to submit answer. Please try again.')
     } finally {
       setSubmitting(false)
     }
   }
 
-  const handleDontKnow = () => handleSubmit("I don't know")
+  // ── Step 2b: User wants to modify → close dialog, keep answer ────
+  const handleModify = () => {
+    setShowConfirm(false)
+    setTimeout(() => {
+      textareaRef.current?.focus()
+      // Move cursor to end of answer
+      const len = textareaRef.current?.value?.length || 0
+      textareaRef.current?.setSelectionRange(len, len)
+    }, 50)
+  }
+
+  const handleDontKnow = () => handleSubmitClick("I don't know")
 
   const handleNext = () => {
     setEvaluation(null)
@@ -73,24 +91,49 @@ export default function InterviewRun() {
   }
 
   const handleKeyDown = (e) => {
-    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) handleSubmit()
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) handleSubmitClick()
   }
 
   const progress = question ? (question.question_id / question.total_questions) * 100 : 0
   const avgScore = qaHistory.length
     ? (qaHistory.reduce((a, b) => a + b.overall_score, 0) / qaHistory.length).toFixed(1)
     : null
-
   const scoreColor = (s) => s >= 4 ? 'var(--green)' : s >= 3 ? 'var(--accent)' : 'var(--red)'
 
   return (
     <div className="run-page">
+
+      {/* ── CONFIRMATION DIALOG (fix 2) ──────────────────────────── */}
+      {showConfirm && (
+        <div className="confirm-overlay">
+          <div className="confirm-modal">
+            <div className="confirm-icon">📝</div>
+            <div className="confirm-title">Ready to submit?</div>
+            <div className="confirm-subtitle">Review your answer before it's evaluated.</div>
+
+            <div className="confirm-answer-preview">
+              {pendingAnswer === "I don't know"
+                ? <span style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>I don't know</span>
+                : pendingAnswer
+              }
+            </div>
+
+            <div className="confirm-actions">
+              <button className="btn-ghost confirm-modify" onClick={handleModify}>
+                ✏ Modify Answer
+              </button>
+              <button className="btn-primary confirm-submit" onClick={handleConfirm}>
+                Submit Answer →
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* HEADER */}
       <div className="run-header">
         <div className="run-header-left">
-          <div className="run-mode-badge">
-            {session?.mode?.toUpperCase()} MODE
-          </div>
+          <div className="run-mode-badge">{session?.mode?.toUpperCase()} MODE</div>
           <span className="run-persona">Interviewer: {session?.persona}</span>
         </div>
         <div className="run-progress-wrap">
@@ -109,7 +152,9 @@ export default function InterviewRun() {
           {loading ? (
             <div className="run-loading">
               <span className="spinner" style={{ width: 24, height: 24, borderColor: 'rgba(232,168,56,0.2)', borderTopColor: 'var(--accent)' }} />
-              <span style={{ fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--text-dim)', marginLeft: 12 }}>Generating question…</span>
+              <span style={{ fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--text-dim)', marginLeft: 12 }}>
+                Loading next question…
+              </span>
             </div>
           ) : (
             <>
@@ -119,9 +164,7 @@ export default function InterviewRun() {
                 <span className="qm-id">#{question?.question_id}</span>
               </div>
 
-              <div className="question-text">
-                {question?.question}
-              </div>
+              <div className="question-text">{question?.question}</div>
 
               {/* ANSWER AREA */}
               {!evaluation && (
@@ -140,7 +183,11 @@ export default function InterviewRun() {
                     <button className="dont-know-btn" onClick={handleDontKnow} disabled={submitting}>
                       I don't know →
                     </button>
-                    <button className="submit-btn" onClick={() => handleSubmit()} disabled={submitting || !answer.trim()}>
+                    <button
+                      className="submit-btn"
+                      onClick={() => handleSubmitClick()}
+                      disabled={submitting || !answer.trim()}
+                    >
                       {submitting
                         ? <><span className="spinner" /> Evaluating…</>
                         : <>Submit Answer ↵</>
@@ -186,7 +233,7 @@ export default function InterviewRun() {
                     <div className="eval-done">
                       <span className="spinner" style={{ width: 16, height: 16, borderColor: 'rgba(232,168,56,0.3)', borderTopColor: 'var(--accent)' }} />
                       <span style={{ fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--text-dim)', marginLeft: 10 }}>
-                        Interview complete — generating your report…
+                        Interview complete — preparing your report…
                       </span>
                     </div>
                   ) : (
@@ -204,13 +251,11 @@ export default function InterviewRun() {
 
         {/* SIDEBAR */}
         <div className="run-sidebar">
-          {/* Session Info */}
           <div className="sidebar-card">
             <div className="sidebar-label">Session</div>
             <div className="sidebar-session-id">{session?.session_id}</div>
           </div>
 
-          {/* Running Average */}
           {avgScore && (
             <div className="sidebar-card">
               <div className="sidebar-label">Running Average</div>
@@ -221,7 +266,6 @@ export default function InterviewRun() {
             </div>
           )}
 
-          {/* Candidate Skills */}
           {session?.resume_summary?.skills && (
             <div className="sidebar-card">
               <div className="sidebar-label">Candidate Skills</div>
@@ -233,7 +277,6 @@ export default function InterviewRun() {
             </div>
           )}
 
-          {/* JD Required Skills */}
           {session?.jd_summary?.required_skills && (
             <div className="sidebar-card">
               <div className="sidebar-label">JD Requirements</div>
@@ -245,7 +288,6 @@ export default function InterviewRun() {
             </div>
           )}
 
-          {/* Q&A History */}
           {qaHistory.length > 0 && (
             <div className="sidebar-card">
               <div className="sidebar-label">Question History</div>

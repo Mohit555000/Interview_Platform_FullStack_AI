@@ -5,21 +5,17 @@ Wraps the existing InterviewEngine with REST endpoints.
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Optional
 import tempfile
 import copy
 import os
 import uuid
 from datetime import datetime
 
-# Import your existing engine
 from interview_platform import InterviewEngine, Config
 
 app = FastAPI(title="InterviewAI API", version="1.0.0")
 
-# ── CORS (allow React dev server) ─────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://localhost:3000"],
@@ -28,11 +24,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── In-memory session store ───────────────────────────────────────
 sessions: dict = {}
 
 
-# ── REQUEST / RESPONSE MODELS ─────────────────────────────────────
+# ── MODELS ────────────────────────────────────────────────────────
 class StartSessionResponse(BaseModel):
     session_id: str
     mode: str
@@ -42,10 +37,8 @@ class StartSessionResponse(BaseModel):
     resume_summary: dict
     jd_summary: dict
 
-
 class AnswerRequest(BaseModel):
     answer: str
-
 
 class AnswerResponse(BaseModel):
     question_id: int
@@ -57,13 +50,11 @@ class AnswerResponse(BaseModel):
     feedback: str
     interview_complete: bool
 
-
 class NextQuestionResponse(BaseModel):
     question_id: int
     question: str
     total_questions: int
     interview_complete: bool
-
 
 class ReportResponse(BaseModel):
     session_id: str
@@ -72,6 +63,52 @@ class ReportResponse(BaseModel):
     final_report: str
     performance_metrics: dict
     weaknesses: list
+
+
+# ── HELPERS ───────────────────────────────────────────────────────
+
+def _delete_session_data(engine: InterviewEngine, session_id: str):
+    """
+    Fix 4: Delete all data for this session from both Neo4j and Qdrant.
+    Called when the session ends so no stale data accumulates.
+    """
+    # ── Neo4j: delete all nodes related to this session ───────────
+    try:
+        driver = engine.neo4j._new_driver()
+        with driver.session() as neo_session:
+            neo_session.run("""
+                MATCH (u:User {session_id: $session_id})
+                OPTIONAL MATCH (u)-[:ASKED]->(q:Question)-[:ANSWERED_BY]->(a:Answer)
+                OPTIONAL MATCH (a)-[:REVEALS]->(w:Weakness)-[:SUGGESTS]->(i:Improvement)
+                OPTIONAL MATCH (u)-[:TARGETS]->(r:Requirement)
+                DETACH DELETE u, q, a, w, i, r
+            """, session_id=session_id)
+            neo_session.run("""
+                MATCH (s:Skill)
+                WHERE NOT (s)--()
+                DELETE s
+            """)
+            print(f"[cleanup] Neo4j data deleted for {session_id}")
+        driver.close()
+    except Exception as e:
+        print(f"[cleanup] Neo4j delete warning for {session_id}: {e}")
+
+    # ── Qdrant: delete all points with matching session_id ─────────
+    try:
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        filter_condition = Filter(
+            must=[FieldCondition(key="session_id", match=MatchValue(value=session_id))]
+        )
+        for collection in ["resume_embeddings", "jd_embeddings", "qa_context"]:
+            try:
+                engine.qdrant.client.delete(
+                    collection_name=collection,
+                    points_selector=filter_condition,
+                )
+            except Exception as e:
+                print(f"[cleanup] Qdrant delete warning ({collection}): {e}")
+    except Exception as e:
+        print(f"[cleanup] Qdrant cleanup warning for {session_id}: {e}")
 
 
 # ── ENDPOINTS ─────────────────────────────────────────────────────
@@ -127,11 +164,7 @@ async def start_session(
         state = engine.plan_interview_node(state)
         state = engine.generate_question_node(state)
 
-        sessions[session_id] = {
-            "engine": engine,
-            "state": state,
-            "mode": mode,
-        }
+        sessions[session_id] = {"engine": engine, "state": state, "mode": mode}
 
         return StartSessionResponse(
             session_id=session_id,
@@ -158,10 +191,8 @@ async def start_session(
 def get_current_question(session_id: str):
     if session_id not in sessions:
         raise HTTPException(404, "Session not found")
-
     sess = sessions[session_id]
     state = sess["state"]
-
     return NextQuestionResponse(
         question_id=state["current_question_num"],
         question=state["current_question"],
@@ -177,8 +208,6 @@ def submit_answer(session_id: str, body: AnswerRequest):
 
     sess = sessions[session_id]
     engine: InterviewEngine = sess["engine"]
-
-    # Deep copy to avoid LangGraph proxy recursion
     state = copy.deepcopy(sess["state"])
 
     state["current_answer"] = body.answer
@@ -212,8 +241,6 @@ def get_report(session_id: str):
 
     sess = sessions[session_id]
     engine: InterviewEngine = sess["engine"]
-
-    # Deep copy to avoid LangGraph proxy recursion
     state = copy.deepcopy(sess["state"])
 
     state = engine.generate_feedback_node(state)
@@ -234,10 +261,13 @@ def get_report(session_id: str):
 
 @app.delete("/session/{session_id}")
 def end_session(session_id: str):
+    """
+    Fix 4: Clean up session — delete all data from Neo4j + Qdrant,
+    then remove from in-memory store.
+    """
     if session_id in sessions:
-        try:
-            sessions[session_id]["engine"].neo4j.close()
-        except Exception:
-            pass
+        engine = sessions[session_id]["engine"]
+        # Delete all persisted data for this session
+        _delete_session_data(engine, session_id)
         del sessions[session_id]
-    return {"deleted": True}
+    return {"deleted": True, "session_id": session_id}

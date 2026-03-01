@@ -5,6 +5,25 @@ export default function Nav() {
   const navigate = useNavigate()
   const location = useLocation()
   const isHome = location.pathname === '/'
+  const handleHome = () => {
+  const activeSession = sessionStorage.getItem('interviewSession')
+  if (activeSession && location.pathname !== '/') {
+    const confirmed = window.confirm(
+      'Going home will end your current session and clear all data. Are you sure?'
+    )
+    if (!confirmed) return
+    
+    // Trigger cleanup before leaving
+    const sess = JSON.parse(activeSession)
+    fetch(`/api/session/${sess.session_id}`, { method: 'DELETE' })
+      .finally(() => {
+        sessionStorage.removeItem('interviewSession')
+        navigate('/')
+      })
+  } else {
+    navigate('/')
+  }
+}
 
   return (
     <nav className="nav">
@@ -19,15 +38,12 @@ export default function Nav() {
           <li><a href="#start">Start</a></li>
         </ul>
       )}
-      <button className="nav-cta" onClick={() => {
-        if (isHome) {
-          document.getElementById('start')?.scrollIntoView({ behavior: 'smooth' })
-        } else {
-          navigate('/')
-        }
-      }}>
-        {isHome ? 'Start Interview' : '← Home'}
-      </button>
+      <button className="nav-cta" onClick={isHome
+  ? () => document.getElementById('start')?.scrollIntoView({ behavior: 'smooth' })
+  : handleHome
+}>
+  {isHome ? 'Start Interview' : '← Home'}
+</button>
     </nav>
   )
 }

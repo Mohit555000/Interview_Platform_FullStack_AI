@@ -3,12 +3,22 @@ import { useNavigate } from 'react-router-dom'
 import { startSession } from '../api/client'
 import './Setup.css'
 
+// ── Friendly initializing steps (no technical backend details) ────
+const INIT_STEPS = [
+  'Uploading your resume…',
+  'Reading job requirements…',
+  'Matching your skills to the role…',
+  'Planning your interview…',
+  'Almost ready…',
+]
+
 export default function Setup() {
   const navigate = useNavigate()
   const [mode, setMode] = useState('standard')
   const [resumeFile, setResumeFile] = useState(null)
   const [jdText, setJdText] = useState('')
   const [loading, setLoading] = useState(false)
+  const [loadingStep, setLoadingStep] = useState(0)
   const [error, setError] = useState('')
   const [dragOver, setDragOver] = useState(false)
 
@@ -25,14 +35,21 @@ export default function Setup() {
     if (!jdText.trim()) { setError('Please enter a job description.'); return }
     setError('')
     setLoading(true)
+    setLoadingStep(0)
+
+    // Cycle through friendly loading messages while backend works
+    const stepInterval = setInterval(() => {
+      setLoadingStep(i => Math.min(i + 1, INIT_STEPS.length - 1))
+    }, 1800)
+
     try {
       const session = await startSession(resumeFile, jdText, mode)
-      // Store session info for the interview page
       sessionStorage.setItem('interviewSession', JSON.stringify(session))
       navigate('/interview/run')
     } catch (err) {
-      setError(err.response?.data?.detail || 'Failed to start session. Is the backend running?')
+      setError(err.response?.data?.detail || 'Failed to start session. Please check your connection and try again.')
     } finally {
+      clearInterval(stepInterval)
       setLoading(false)
     }
   }
@@ -54,11 +71,7 @@ export default function Setup() {
               { id: 'quick', label: 'Quick', duration: '10 min', questions: '7 Questions', persona: 'Senior Software Engineer', desc: 'Fast-paced screening round. Core concepts and fundamentals.' },
               { id: 'standard', label: 'Standard', duration: '20 min', questions: '12 Questions', persona: 'Technical Lead', desc: 'Full technical deep-dive. Architecture, design patterns, problem-solving.' },
             ].map(m => (
-              <div
-                key={m.id}
-                className={`mode-card ${mode === m.id ? 'active' : ''}`}
-                onClick={() => setMode(m.id)}
-              >
+              <div key={m.id} className={`mode-card ${mode === m.id ? 'active' : ''}`} onClick={() => setMode(m.id)}>
                 <div className="mode-top">
                   <div className="mode-name">{m.label}</div>
                   <div className="mode-radio">{mode === m.id && <span className="mode-radio-dot" />}</div>
@@ -89,10 +102,7 @@ export default function Setup() {
               type="file"
               accept=".pdf"
               style={{ display: 'none' }}
-              onChange={e => {
-                const f = e.target.files[0]
-                if (f) setResumeFile(f)
-              }}
+              onChange={e => { const f = e.target.files[0]; if (f) setResumeFile(f) }}
             />
             {resumeFile ? (
               <div className="drop-file-info">
@@ -131,21 +141,21 @@ export default function Setup() {
 
         {/* SUBMIT */}
         <button className="btn-primary setup-submit" onClick={handleSubmit} disabled={loading}>
-          {loading ? (
-            <>
-              <span className="spinner" />
-              Initializing Interview…
-            </>
-          ) : (
-            <>Start Interview Session →</>
-          )}
+          {loading
+            ? <><span className="spinner" /> {INIT_STEPS[loadingStep]}</>
+            : <>Start Interview Session →</>
+          }
         </button>
 
+        {/* FRIENDLY PROGRESS DOTS — no technical messages */}
         {loading && (
-          <div className="setup-loading-info">
-            <div className="t-line"><span className="t-success">▸</span><span style={{ fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--text-dim)' }}>Connecting to backend · Parsing resume · Building question plan…</span></div>
+          <div className="setup-progress-dots">
+            {INIT_STEPS.map((_, i) => (
+              <span key={i} className={`loading-dot ${i <= loadingStep ? 'active' : ''}`} />
+            ))}
           </div>
         )}
+
       </div>
     </div>
   )

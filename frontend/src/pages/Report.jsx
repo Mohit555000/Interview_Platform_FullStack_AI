@@ -17,38 +17,19 @@ function renderInline(text) {
 // ── Parses the LLM markdown report into structured React nodes ────
 function ReportText({ text }) {
   if (!text) return null
-
   const lines = text.split('\n')
-
   return (
     <div className="report-text">
       {lines.map((line, i) => {
         const trimmed = line.trim()
-
-        if (!trimmed) {
-          return <div key={i} style={{ height: 10 }} />
-        }
-
+        if (!trimmed) return <div key={i} style={{ height: 10 }} />
         if (trimmed.startsWith('### ')) {
-          return (
-            <div key={i} className="report-h1">
-              {trimmed.replace(/^###\s+/, '')}
-            </div>
-          )
+          return <div key={i} className="report-h1">{trimmed.replace(/^###\s+/, '')}</div>
         }
-
         if (trimmed.startsWith('#### ')) {
-          return (
-            <div key={i} className="report-h2">
-              {trimmed.replace(/^####\s+/, '')}
-            </div>
-          )
+          return <div key={i} className="report-h2">{trimmed.replace(/^####\s+/, '')}</div>
         }
-
-        if (trimmed === '---') {
-          return <hr key={i} className="report-divider" />
-        }
-
+        if (trimmed === '---') return <hr key={i} className="report-divider" />
         if (/^\d+\.\s/.test(trimmed)) {
           const num = trimmed.match(/^\d+/)[0]
           const content = trimmed.replace(/^\d+\.\s+/, '')
@@ -59,7 +40,6 @@ function ReportText({ text }) {
             </div>
           )
         }
-
         if (trimmed.startsWith('- ')) {
           return (
             <div key={i} className="report-bullet">
@@ -68,13 +48,56 @@ function ReportText({ text }) {
             </div>
           )
         }
-
-        return (
-          <p key={i} className="report-para">
-            {renderInline(trimmed)}
-          </p>
-        )
+        return <p key={i} className="report-para">{renderInline(trimmed)}</p>
       })}
+    </div>
+  )
+}
+
+// ── Friendly loading steps shown to the user (no technical details) ──
+const LOADING_STEPS = [
+  'Reviewing your answers…',
+  'Calculating your scores…',
+  'Identifying strengths…',
+  'Building improvement plan…',
+  'Writing your report…',
+]
+
+function LoadingReport() {
+  const [stepIndex, setStepIndex] = useState(0)
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setStepIndex(i => Math.min(i + 1, LOADING_STEPS.length - 1))
+    }, 2200)
+    return () => clearInterval(interval)
+  }, [])
+
+  return (
+    <div className="report-loading">
+      <div className="report-loading-inner">
+        <div className="report-loading-ring">
+          <span className="spinner" style={{
+            width: 40, height: 40,
+            borderColor: 'rgba(232,168,56,0.15)',
+            borderTopColor: 'var(--accent)',
+            borderWidth: 3,
+          }} />
+        </div>
+        <div className="report-loading-text">
+          <div style={{ fontFamily: 'var(--display)', fontSize: 26, fontWeight: 700, marginBottom: 12 }}>
+            Generating Your Report
+          </div>
+          <div className="report-loading-step">
+            {LOADING_STEPS[stepIndex]}
+          </div>
+          <div className="report-loading-dots">
+            {LOADING_STEPS.map((_, i) => (
+              <span key={i} className={`loading-dot ${i <= stepIndex ? 'active' : ''}`} />
+            ))}
+          </div>
+        </div>
+      </div>
     </div>
   )
 }
@@ -89,10 +112,7 @@ export default function Report() {
 
   useEffect(() => {
     const raw = sessionStorage.getItem('interviewSession')
-    if (!raw) {
-      navigate('/interview')
-      return
-    }
+    if (!raw) { navigate('/interview'); return }
     const sess = JSON.parse(raw)
     setSession(sess)
     fetchReport(sess.session_id)
@@ -106,7 +126,7 @@ export default function Report() {
       sessionStorage.removeItem('interviewSession')
       sessionStorage.removeItem('qaHistory')
     } catch (err) {
-      setError(err?.response?.data?.detail || 'Failed to generate report. Please try again.')
+      setError(err?.response?.data?.detail || 'Something went wrong while generating your report. Please try again.')
     } finally {
       setLoading(false)
     }
@@ -125,46 +145,17 @@ export default function Report() {
     return 'Needs Improvement'
   }
 
-  if (loading) {
-    return (
-      <div className="report-loading">
-        <div className="report-loading-inner">
-          <span
-            className="spinner"
-            style={{
-              width: 32, height: 32,
-              borderColor: 'rgba(232,168,56,0.2)',
-              borderTopColor: 'var(--accent)'
-            }}
-          />
-          <div className="report-loading-text">
-            <div style={{ fontFamily: 'var(--display)', fontSize: 24, fontWeight: 700, marginBottom: 8 }}>
-              Generating Report
-            </div>
-            <div style={{ fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--text-muted)', letterSpacing: '0.06em' }}>
-              Querying Neo4j · Analyzing performance · Writing recommendations…
-            </div>
-          </div>
-        </div>
-      </div>
-    )
-  }
+  if (loading) return <LoadingReport />
 
   if (error) {
     return (
       <div className="report-loading">
-        <div style={{
-          fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--red)',
-          border: '1px solid rgba(248,113,113,0.3)', padding: '20px 28px',
-          background: 'var(--red-dim)'
-        }}>
-          ⚠️ {error}
+        <div className="report-error-box">
+          <div className="report-error-icon">⚠</div>
+          <div className="report-error-title">Report generation failed</div>
+          <div className="report-error-msg">{error}</div>
         </div>
-        <button
-          className="btn-primary"
-          style={{ marginTop: 24 }}
-          onClick={() => navigate('/interview')}
-        >
+        <button className="btn-primary" style={{ marginTop: 24 }} onClick={() => navigate('/interview')}>
           Start New Interview →
         </button>
       </div>
@@ -179,11 +170,9 @@ export default function Report() {
         <div className="report-top">
           <div>
             <div className="section-label">Performance Report</div>
-            <h1 className="section-title" style={{ marginBottom: 8 }}>
-              Interview Complete
-            </h1>
+            <h1 className="section-title" style={{ marginBottom: 8 }}>Interview Complete</h1>
             <div style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-muted)', letterSpacing: '0.06em' }}>
-              {report?.session_id} · {new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}
+              {new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}
             </div>
           </div>
           <div className="overall-badge">
@@ -208,10 +197,7 @@ export default function Report() {
               </div>
               <div className="score-card-max">/5.0</div>
               <div className="score-card-bar">
-                <div
-                  className="score-card-fill"
-                  style={{ width: `${((score ?? 0) / 5) * 100}%`, background: scoreColor(score) }}
-                />
+                <div className="score-card-fill" style={{ width: `${((score ?? 0) / 5) * 100}%`, background: scoreColor(score) }} />
               </div>
               <div className="score-card-sub">{sub}</div>
             </div>
@@ -221,9 +207,7 @@ export default function Report() {
             <div className="score-card-val" style={{ color: scoreColor(report?.overall_rating), fontSize: 22 }}>
               {readiness(report?.overall_rating)}
             </div>
-            <div className="score-card-sub">
-              {report?.performance_metrics?.total_questions ?? 0} questions answered
-            </div>
+            <div className="score-card-sub">{report?.performance_metrics?.total_questions ?? 0} questions answered</div>
           </div>
         </div>
 
@@ -245,7 +229,7 @@ export default function Report() {
           </div>
         )}
 
-        {/* DETAILED FEEDBACK REPORT */}
+        {/* DETAILED REPORT */}
         <div className="report-section-card">
           <div className="rsc-label">Detailed Feedback Report</div>
           <ReportText text={report?.final_report} />
