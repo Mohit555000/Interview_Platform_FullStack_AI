@@ -50,13 +50,14 @@ class Config:
     NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
     NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
     NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
-    
-    # Interview configurations
+
+    # ── V2: Removed hardcoded personas from INTERVIEW_MODES ──────
+    # Persona is now generated dynamically from the JD in plan_interview_node
     INTERVIEW_MODES = {
-        "quick": {"duration": 10, "questions": 7, "persona": "Senior Software Engineer"},
-        "standard": {"duration": 20, "questions": 12, "persona": "Technical Lead"}
+        "quick":    {"duration": 10, "questions": 7},
+        "standard": {"duration": 20, "questions": 12},
     }
-    
+
     # Model settings
     LLM_MODEL = "gpt-4o-mini"
     EMBEDDING_MODEL = "text-embedding-3-small"
@@ -104,25 +105,29 @@ class InterviewState(TypedDict):
     resume_text: str
     jd_text: str
     interview_mode: str
-    
+
     # Parsed data
     resume_data: Optional[Dict[str, Any]]
     jd_requirements: Optional[Dict[str, Any]]
-    
+
     # Interview progress
     current_question_num: int
     max_questions: int
     questions_asked: List[str]
     qa_history: List[Dict[str, Any]]
-    
+
     # Session data
     session_id: str
     user_id: str
-    
+
     # Current interaction
     current_question: str
     current_answer: str
-    
+    current_answer_cleaned: Optional[str]
+
+    # ── V2: Dynamic interviewer persona ──────────────────────────
+    interviewer_persona: Optional[str]
+
     # Final output
     final_report: Optional[str]
     overall_rating: Optional[float]
@@ -134,25 +139,22 @@ class InterviewState(TypedDict):
 
 class QdrantManager:
     """Manages Qdrant vector database operations"""
-    
+
     def __init__(self):
         self.client = QdrantClient(
             url=f"https://{Config.QDRANT_HOST}",
             api_key=Config.QDRANT_API_KEY,
             timeout=60
         )
-
         self.embeddings = OpenAIEmbeddings(
             model=Config.EMBEDDING_MODEL,
             openai_api_key=Config.OPENAI_API_KEY
         )
-
         self._setup_collections()
-    
+
     def _setup_collections(self):
         """Create collections if they don't exist"""
         collections = ["resume_embeddings", "jd_embeddings", "qa_context"]
-        
         for collection in collections:
             if not self.client.collection_exists(collection):
                 self.client.create_collection(
@@ -163,99 +165,69 @@ class QdrantManager:
                     )
                 )
             self.client.create_payload_index(
-            collection_name=collection,
-            field_name="session_id",
-            field_schema="keyword"
-        )
-    def _batch_upsert(self, collection_name, points, batch_size=50):
-            """Upsert points in batches to avoid timeout"""
-            for i in range(0, len(points), batch_size):
-                batch = points[i:i + batch_size]
-                self.client.upsert(
-                collection_name=collection_name,
-                points=batch
+                collection_name=collection,
+                field_name="session_id",
+                field_schema="keyword"
             )
-    
+
+    def _batch_upsert(self, collection_name, points, batch_size=50):
+        """Upsert points in batches to avoid timeout"""
+        for i in range(0, len(points), batch_size):
+            batch = points[i:i + batch_size]
+            self.client.upsert(collection_name=collection_name, points=batch)
+
     def store_resume_data(self, session_id: str, resume_data: Dict[str, Any]):
         """Store resume embeddings"""
         points = []
-        
-        # Store skills
-        for idx, skill in enumerate(resume_data.get("skills", [])):
+        for skill in resume_data.get("skills", []):
             vector = self.embeddings.embed_query(skill)
             points.append(PointStruct(
-                id=str(uuid.uuid4()),
-                vector=vector,
+                id=str(uuid.uuid4()), vector=vector,
                 payload={"session_id": session_id, "type": "skill", "content": skill}
             ))
-        
-        # Store projects
-        for idx, project in enumerate(resume_data.get("projects", [])):
+        for project in resume_data.get("projects", []):
             vector = self.embeddings.embed_query(project)
             points.append(PointStruct(
-                id=str(uuid.uuid4()),
-                vector=vector,
+                id=str(uuid.uuid4()), vector=vector,
                 payload={"session_id": session_id, "type": "project", "content": project}
             ))
-        
         if points:
             self._batch_upsert("resume_embeddings", points)
-    
+
     def store_jd_requirements(self, session_id: str, jd_requirements: Dict[str, Any]):
         """Store JD embeddings"""
         points = []
-        
-        for idx, skill in enumerate(jd_requirements.get("required_skills", [])):
+        for skill in jd_requirements.get("required_skills", []):
             vector = self.embeddings.embed_query(skill)
             points.append(PointStruct(
-                id=str(uuid.uuid4()),
-                vector=vector,
+                id=str(uuid.uuid4()), vector=vector,
                 payload={"session_id": session_id, "type": "requirement", "content": skill, "priority": "high"}
             ))
-        
         if points:
             self._batch_upsert("jd_embeddings", points)
-    
+
     def store_qa(self, session_id: str, qa_id: int, question: str, answer: str, score: float):
         """Store Q&A for context"""
         context = f"Q: {question}\nA: {answer}"
         vector = self.embeddings.embed_query(context)
-        
         self.client.upsert(
             collection_name="qa_context",
             points=[PointStruct(
-                id=str(uuid.uuid4()),
-                vector=vector,
-                payload={
-                    "session_id": session_id,
-                    "question": question,
-                    "answer": answer,
-                    "score": score
-                }
+                id=str(uuid.uuid4()), vector=vector,
+                payload={"session_id": session_id, "question": question, "answer": answer, "score": score}
             )]
         )
 
-
-    
-    
     def search_relevant_topics(self, query: str, session_id: str, limit: int = 3):
         query_vector = self.embeddings.embed_query(query)
-
         results = self.client.query_points(
             collection_name="jd_embeddings",
             query=query_vector,
             limit=limit,
-            query_filter=Filter(
-                must=[
-                    FieldCondition(
-                        key="session_id",
-                        match=MatchValue(value=session_id)
-                    )
-                ]
-            )
+            query_filter=Filter(must=[FieldCondition(key="session_id", match=MatchValue(value=session_id))])
         )
-        
         return [r.payload.get("content") for r in results.points]
+
 
 class Neo4jManager:
     """Manages Neo4j graph database operations"""
@@ -267,20 +239,16 @@ class Neo4jManager:
         self._setup_constraints()
 
     def _new_driver(self):
-        """Always create a brand new driver — never reuse stale connections."""
         return GraphDatabase.driver(
-            self.uri,
-            auth=self.auth,
-            max_connection_lifetime=100,
-            connection_timeout=30,
+            self.uri, auth=self.auth,
+            max_connection_lifetime=100, connection_timeout=30,
         )
 
     def _get_session(self):
-        """Return a session from a fresh driver. Caller must close the driver."""
         return self._new_driver().session()
 
     def close(self):
-        pass  # Nothing to close — drivers are created fresh per operation
+        pass
 
     def _setup_constraints(self):
         driver = self._new_driver()
@@ -352,10 +320,7 @@ class Neo4jManager:
                     overall_score=qa_data["overall_score"]
                 )
                 if qa_data["overall_score"] < 3.0:
-                    # Use the actual question as the weakness area, not the generic feedback
                     weakness_area = qa_data.get("question", "Unknown topic")[:200]
-    
-                    # Build a specific recommendation based on score
                     score = qa_data["overall_score"]
                     if score <= 1.0:
                         recommendation = f"No answer provided. Study this topic from scratch: '{weakness_area[:80]}'"
@@ -363,18 +328,17 @@ class Neo4jManager:
                         recommendation = f"Very weak answer. Deep dive into: '{weakness_area[:80]}'"
                     else:
                         recommendation = f"Partial understanding. Revisit and practice: '{weakness_area[:80]}'"
-
                     session.run("""
                         MATCH (a:Answer)<-[:ANSWERED_BY]-(q:Question {id: $qa_id})
                         CREATE (w:Weakness {area: $weakness_area, severity: $severity})
                         CREATE (a)-[:REVEALS]->(w)
                         CREATE (w)-[:SUGGESTS]->(i:Improvement {recommendation: $recommendation})
                     """,
-                    qa_id=qa_data["question_id"],
-                    weakness_area=weakness_area,
-                    severity="high" if score < 2.0 else "medium",
-                    recommendation=recommendation
-                )
+                        qa_id=qa_data["question_id"],
+                        weakness_area=weakness_area,
+                        severity="high" if score < 2.0 else "medium",
+                        recommendation=recommendation
+                    )
         finally:
             driver.close()
 
@@ -414,8 +378,10 @@ class Neo4jManager:
                     RETURN w.area as weakness, w.severity as severity, i.recommendation as improvement
                     ORDER BY w.severity DESC
                 """, session_id=session_id)
-                return [{"weakness": r["weakness"], "severity": r["severity"], "improvement": r["improvement"]}
-                        for r in result]
+                return [
+                    {"weakness": r["weakness"], "severity": r["severity"], "improvement": r["improvement"]}
+                    for r in result
+                ]
         finally:
             driver.close()
 
@@ -424,25 +390,18 @@ class Neo4jManager:
 # ===================================================================
 
 class ResumeParser:
-    """Parse resume PDF to structured data"""
-    
-    def __init__(self, llm: ChatOpenAI):
+    def __init__(self, llm):
         self.llm = llm
-    
+
     def extract_text_from_pdf(self, pdf_path: str) -> str:
-        """Extract text from PDF"""
         try:
             with open(pdf_path, 'rb') as file:
                 reader = PyPDF2.PdfReader(file)
-                text = ""
-                for page in reader.pages:
-                    text += page.extract_text()
-                return text
+                return "".join(page.extract_text() for page in reader.pages)
         except Exception as e:
             raise Exception(f"Error reading PDF: {str(e)}")
-    
+
     def parse(self, resume_text: str) -> ResumeData:
-        """Parse resume text into structured data using LLM"""
         prompt = ChatPromptTemplate.from_messages([
             ("system", """You are a resume parser. Extract the following information from the resume:
             - skills: List of technical skills
@@ -450,24 +409,19 @@ class ResumeParser:
             - projects: List of key projects mentioned
             - education: Highest degree
             - summary: Brief 2-line summary of candidate's profile
-            
             Return ONLY a valid JSON object with these exact keys."""),
             ("user", "{resume_text}")
         ])
-        
         chain = prompt | self.llm | JsonOutputParser()
         result = chain.invoke({"resume_text": resume_text})
-        
         return ResumeData(**result)
 
+
 class JDParser:
-    """Parse job description to structured data"""
-    
-    def __init__(self, llm: ChatOpenAI):
+    def __init__(self, llm):
         self.llm = llm
-    
+
     def parse(self, jd_text: str) -> JDRequirements:
-        """Parse JD text into structured data"""
         prompt = ChatPromptTemplate.from_messages([
             ("system", """You are a job description parser. Extract:
             - required_skills: Must-have technical skills
@@ -475,14 +429,11 @@ class JDParser:
             - responsibilities: Key job responsibilities
             - experience_level: junior/mid/senior
             - summary: Brief 2-line summary of the role
-            
             Return ONLY a valid JSON object with these exact keys."""),
             ("user", "{jd_text}")
         ])
-        
         chain = prompt | self.llm | JsonOutputParser()
         result = chain.invoke({"jd_text": jd_text})
-        
         return JDRequirements(**result)
 
 # ===================================================================
@@ -491,7 +442,7 @@ class JDParser:
 
 class InterviewEngine:
     """Main interview orchestration using LangGraph"""
-    
+
     def __init__(self):
         self.llm = ChatOpenAI(
             model=Config.LLM_MODEL,
@@ -502,116 +453,119 @@ class InterviewEngine:
         self.neo4j = Neo4jManager()
         self.resume_parser = ResumeParser(self.llm)
         self.jd_parser = JDParser(self.llm)
-        
-        # Build state machine
         self.graph = self._build_graph()
-    
+
     def _build_graph(self) -> StateGraph:
-        """Build LangGraph state machine"""
         workflow = StateGraph(InterviewState)
-        
-        # Add nodes
         workflow.add_node("parse_resume", self.parse_resume_node)
         workflow.add_node("parse_jd", self.parse_jd_node)
         workflow.add_node("plan_interview", self.plan_interview_node)
         workflow.add_node("generate_question", self.generate_question_node)
         workflow.add_node("get_answer", self.get_answer_node)
+        workflow.add_node("clean_response", self.clean_response_node)
         workflow.add_node("evaluate_answer", self.evaluate_answer_node)
         workflow.add_node("adapt", self.adaptation_node)
         workflow.add_node("generate_feedback", self.generate_feedback_node)
-        
-        # Define flow
         workflow.set_entry_point("parse_resume")
         workflow.add_edge("parse_resume", "parse_jd")
         workflow.add_edge("parse_jd", "plan_interview")
         workflow.add_edge("plan_interview", "generate_question")
         workflow.add_edge("generate_question", "get_answer")
-        workflow.add_edge("get_answer", "evaluate_answer")
+        workflow.add_edge("get_answer", "clean_response")        # ← new
+        workflow.add_edge("clean_response", "evaluate_answer")   # ← new
         workflow.add_edge("evaluate_answer", "adapt")
-        
-        # Conditional edge from adapt
         workflow.add_conditional_edges(
-            "adapt",
-            self.should_continue,
-            {
-                "continue": "generate_question",
-                "end": "generate_feedback"
-            }
+            "adapt", self.should_continue,
+            {"continue": "generate_question", "end": "generate_feedback"}
         )
-        
         workflow.add_edge("generate_feedback", END)
-        
         return workflow.compile()
-    
+
     def parse_resume_node(self, state: InterviewState) -> InterviewState:
-        """Node: Parse resume"""
         click.echo("\n📄 Parsing resume...")
-        
         resume_data = self.resume_parser.parse(state["resume_text"])
         state["resume_data"] = resume_data.dict()
-        
-        # Store in databases
         self.qdrant.store_resume_data(state["session_id"], state["resume_data"])
         self.neo4j.create_user_session(state["session_id"], state["resume_data"])
-        
         click.echo(f"✓ Found {len(resume_data.skills)} skills, {resume_data.experience_years} years experience")
-        
         return state
-    
+
     def parse_jd_node(self, state: InterviewState) -> InterviewState:
-        """Node: Parse job description"""
         click.echo("\n📋 Analyzing job requirements...")
-        
         jd_requirements = self.jd_parser.parse(state["jd_text"])
         state["jd_requirements"] = jd_requirements.dict()
-        
-        # Store in databases
         self.qdrant.store_jd_requirements(state["session_id"], state["jd_requirements"])
         self.neo4j.create_jd_requirements(state["session_id"], state["jd_requirements"])
-        
         click.echo(f"✓ Identified {len(jd_requirements.required_skills)} required skills")
-        
         return state
-    
+
     def plan_interview_node(self, state: InterviewState) -> InterviewState:
-        """Node: Plan interview structure"""
+        """Node: Plan interview — dynamically generate role-agnostic interviewer persona from JD"""
         mode_config = Config.INTERVIEW_MODES[state["interview_mode"]]
         state["max_questions"] = mode_config["questions"]
         state["current_question_num"] = 0
         state["qa_history"] = []
         state["questions_asked"] = []
-        
-        click.echo(f"\n🎯 Starting {mode_config['duration']}-minute interview as {mode_config['persona']}")
+
+        # ── V2: Generate persona dynamically from JD ─────────────
+        # Works for any role: Data Scientist, DevOps, PM, ML Engineer, etc.
+        persona_prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are an expert at identifying job roles and seniority levels.
+Given a job description, return a short interviewer persona title (3–6 words).
+Examples:
+- 'Senior Data Scientist'
+- 'ML Engineering Lead'
+- 'DevOps Architect'
+- 'Product Manager'
+- 'Frontend Engineering Lead'
+- 'Backend Software Engineer'
+- 'Cloud Infrastructure Engineer'
+- 'AI Research Scientist'
+
+Return ONLY the title. No explanation, no punctuation, no extra words."""),
+            ("user", f"Job Description:\n{state['jd_text'][:800]}\n\nInterviewer persona title:")
+        ])
+        persona_chain = persona_prompt | self.llm | StrOutputParser()
+        persona = persona_chain.invoke({}).strip()
+
+        # Fallback in case LLM returns something weird
+        if not persona or len(persona) > 60:
+            persona = f"{state['jd_requirements']['experience_level'].title()} Technical Interviewer"
+
+        state["interviewer_persona"] = persona
+
+        click.echo(f"\n🎯 Starting {mode_config['duration']}-minute interview as {persona}")
         click.echo(f"   Total questions: {mode_config['questions']}\n")
-        
+
         return state
-    
+
     def generate_question_node(self, state: InterviewState) -> InterviewState:
-        """Node: Generate next question"""
+        """Node: Generate next question using dynamic persona"""
         mode_config = Config.INTERVIEW_MODES[state["interview_mode"]]
-        
+
+        # ── V2: Use dynamic persona from state ───────────────────
+        persona = state.get("interviewer_persona") or "Technical Interviewer"
+
         # Get context from previous Q&As
         context = "\n".join([
             f"Q{i+1}: {qa['question']}\nA: {qa['answer'][:100]}... (Score: {qa['overall_score']})"
-            for i, qa in enumerate(state["qa_history"][-3:])  # Last 3 Q&As
+            for i, qa in enumerate(state["qa_history"][-3:])
         ])
-        
+
         # Search relevant JD topics not yet covered
         covered_topics = [qa["question"] for qa in state["qa_history"]]
         relevant_topics = self.qdrant.search_relevant_topics(
             " ".join(covered_topics) if covered_topics else "general interview",
             state["session_id"]
         )
-        
-        # Check if last answer was weak - generate easier follow-up
+
+        # Check if last answer was weak — generate easier follow-up
         is_follow_up = False
         if state["qa_history"] and state["qa_history"][-1]["overall_score"] < 3.0:
             is_follow_up = True
-            last_topic = state["qa_history"][-1]["question"]
-        
-        # Generate question
+
         prompt = ChatPromptTemplate.from_messages([
-            ("system", f"""You are a {mode_config['persona']} conducting a technical interview.
+            ("system", f"""You are a {persona} conducting a technical interview.
 
 Candidate Profile:
 - Skills: {', '.join(state['resume_data']['skills'])}
@@ -621,37 +575,89 @@ Candidate Profile:
 Job Requirements:
 - Required Skills: {', '.join(state['jd_requirements']['required_skills'])}
 - Level: {state['jd_requirements']['experience_level']}
+- Role Summary: {state['jd_requirements']['summary']}
 
 Interview Progress: Question {state['current_question_num'] + 1}/{state['max_questions']}
 Previous Q&As:
 {context if context else 'None yet'}
 
-{'IMPORTANT: The candidate struggled with the last question. Ask an EASIER follow-up question on the same topic to help them demonstrate understanding.' if is_follow_up else 'Ask a balanced question covering: ' + ', '.join(relevant_topics[:2])}
+{'IMPORTANT: The candidate struggled with the last question. Ask an EASIER follow-up on the same topic.' if is_follow_up else 'Ask a balanced question covering: ' + ', '.join(relevant_topics[:2]) if relevant_topics else 'Ask a relevant question based on the job requirements.'}
 
-Generate ONE focused technical question. Be direct and clear. Do not include any preamble."""),
+Generate ONE focused question relevant to this specific role. Be direct and clear. No preamble."""),
             ("user", "Generate the next interview question.")
         ])
-        
+
         chain = prompt | self.llm | StrOutputParser()
         question = chain.invoke({}).strip()
-        
+
         state["current_question"] = question
         state["current_question_num"] += 1
         state["questions_asked"].append(question)
-        
+
         return state
-    
+
     def get_answer_node(self, state: InterviewState) -> InterviewState:
         """Node: Get answer from user (CLI input)"""
         click.echo(f"\n{'='*70}")
         click.echo(f"Question {state['current_question_num']}/{state['max_questions']}")
         click.echo(f"{'='*70}")
         click.echo(f"\n{state['current_question']}\n")
-        
         answer = click.prompt("Your answer", type=str)
         state["current_answer"] = answer
-        
         return state
+    def clean_response_node(self, state: InterviewState) -> InterviewState:
+        """
+            V2: Query Optimization Layer
+            Cleans and normalizes the user's answer before LLM evaluation.
+            Handles filler words, speech noise, incomplete sentences.
+            Original answer is preserved in current_answer.
+            Cleaned version stored in current_answer_cleaned.
+        """
+        original = state["current_answer"].strip()
+        # Skip cleaning for don't-know responses — no point optimizing them
+        if self._is_dont_know_response(original):
+            state["current_answer_cleaned"] = original
+            return state
+         # Skip cleaning for very short answers (less than 10 words)
+        if len(original.split()) < 10:
+            state["current_answer_cleaned"] = original
+            return state
+        clean_prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are a technical interview response optimizer.Your job is to clean and improve a candidate's spoken/typed answer for accurate evaluation.
+
+        Rules:
+        1. Remove filler words: um, uh, like, you know, basically, literally, kind of, sort of, right, okay, so
+        2. Fix obvious speech-to-text errors and typos
+        3. Complete any clearly incomplete sentences
+        4. Preserve ALL technical content, terminology, and meaning exactly
+        5. Do NOT add new information or correct technical mistakes — only clean language
+        6. Do NOT change the candidate's actual knowledge level
+        7. Keep the same structure and flow
+
+        Return ONLY the cleaned answer text. No explanation, no preamble."""),
+            ("user", "Original answer:\n{answer}\n\nCleaned answer:")
+        ])
+        try:
+            clean_chain = clean_prompt | self.llm | StrOutputParser()
+            cleaned = clean_chain.invoke({"answer": original}).strip()
+
+            # Safety check — if cleaning produced something too different or empty, use original
+            if not cleaned or len(cleaned) < len(original) * 0.3:
+                cleaned = original
+
+            state["current_answer_cleaned"] = cleaned
+
+            # Log if significant changes were made
+            if cleaned != original:
+                click.echo("✓ Response optimized for evaluation")
+
+        except Exception:
+            # Always fall back to original if cleaning fails
+            state["current_answer_cleaned"] = original
+
+        return state
+
+
     def _is_dont_know_response(self, answer: str) -> bool:
         """Detect if the user is admitting they don't know the answer"""
         dont_know_phrases = [
@@ -666,14 +672,12 @@ Generate ONE focused technical question. Be direct and clear. Do not include any
         answer_lower = answer.strip().lower()
         return any(phrase in answer_lower for phrase in dont_know_phrases)
 
-    
     def evaluate_answer_node(self, state: InterviewState) -> InterviewState:
         """Node: Evaluate answer quality"""
         click.echo("\n⏳ Evaluating your answer...")
-        # ── Handle "I don't know" responses immediately ────────────────────────
+
         if self._is_dont_know_response(state["current_answer"]):
             click.echo("\n📝 No worries — noted that you weren't familiar with this topic.")
-
             qa_record = {
                 "question_id": state["current_question_num"],
                 "question": state["current_question"],
@@ -693,51 +697,48 @@ Generate ONE focused technical question. Be direct and clear. Do not include any
             self.neo4j.store_qa_evaluation(state["session_id"], qa_record)
             click.echo("✓ Score: 1.0/5.0")
             return state
-        
+
         # Check for off-topic
         off_topic_prompt = ChatPromptTemplate.from_messages([
             ("system", """Determine if the answer addresses the question.
-            Return ONLY a JSON with: {{"is_off_topic": true/false, "reason": "brief explanation"}}"""),
+Return ONLY a JSON with: {{"is_off_topic": true/false, "reason": "brief explanation"}}"""),
             ("user", "Question: {question}\n\nAnswer: {answer}")
         ])
-        
         off_topic_chain = off_topic_prompt | self.llm | JsonOutputParser()
         off_topic_result = off_topic_chain.invoke({
-            "question": state["current_question"],
-            "answer": state["current_answer"]
-        })
-        
+    "question": state["current_question"],
+    "answer": state.get("current_answer_cleaned") or state["current_answer"]
+})
+
         if off_topic_result.get("is_off_topic"):
             click.echo(f"\n⚠️  Off-topic detected: {off_topic_result['reason']} (continuing anyway)")
-        
+
         # Evaluate answer
         eval_prompt = ChatPromptTemplate.from_messages([
             ("system", """Evaluate this interview answer on a scale of 1-5:
-            
-1. Technical Accuracy (40% weight): Correctness, depth, best practices
-2. Clarity (30% weight): Structure, examples, conciseness  
-3. Confidence (20% weight): Fluency, terminology usage
-4. Problem-Solving (10% weight): Logical thinking, edge cases
 
-Return ONLY a JSON:
-{{
-    "technical_score": float,
-    "clarity_score": float,
-    "confidence_score": float,
-    "problem_solving_score": float,
-    "overall_score": float (weighted average),
-    "feedback": "Brief feedback on what was good/missing"
-}}"""),
-            ("user", "Question: {question}\n\nAnswer: {answer}")
+            1. Technical Accuracy (40% weight): Correctness, depth, best practices
+            2. Clarity (30% weight): Structure, examples, conciseness
+            3. Confidence (20% weight): Fluency, terminology usage
+            4. Problem-Solving (10% weight): Logical thinking, edge cases
+
+            Return ONLY a JSON:
+        {{
+        "technical_score": float,
+        "clarity_score": float,
+        "confidence_score": float,
+        "problem_solving_score": float,
+        "overall_score": float,
+        "feedback": "Brief feedback on what was good/missing"
+        }}"""),
+        ("user", "Question: {question}\n\nAnswer: {answer}")
         ])
-        
         eval_chain = eval_prompt | self.llm | JsonOutputParser()
         evaluation = eval_chain.invoke({
-            "question": state["current_question"],
-            "answer": state["current_answer"]
+        "question": state["current_question"],
+        "answer": state.get("current_answer_cleaned") or state["current_answer"]
         })
-        
-        # Create Q&A record
+
         qa_record = {
             "question_id": state["current_question_num"],
             "question": state["current_question"],
@@ -749,83 +750,74 @@ Return ONLY a JSON:
             "feedback": evaluation["feedback"],
             "is_off_topic": off_topic_result.get("is_off_topic", False)
         }
-        
+
         state["qa_history"].append(qa_record)
-        
-        # Store in databases
         self.qdrant.store_qa(
-            state["session_id"],
-            state["current_question_num"],
-            state["current_question"],
-            state["current_answer"],
+            state["session_id"], state["current_question_num"],
+            state["current_question"], state["current_answer"],
             evaluation["overall_score"]
         )
         self.neo4j.store_qa_evaluation(state["session_id"], qa_record)
-        
         click.echo(f"✓ Score: {evaluation['overall_score']:.1f}/5.0")
-        
         return state
-    
+
     def adaptation_node(self, state: InterviewState) -> InterviewState:
-        """Node: Decide adaptation strategy"""
-        # This node doesn't modify state, just used for routing
         return state
-    
+
     def should_continue(self, state: InterviewState) -> str:
-        """Conditional edge: Check if interview should continue"""
         if state["current_question_num"] >= state["max_questions"]:
             return "end"
         return "continue"
-    
+
     def generate_feedback_node(self, state: InterviewState) -> InterviewState:
         """Node: Generate final comprehensive feedback"""
         click.echo("\n\n" + "="*70)
         click.echo("📊 GENERATING PERFORMANCE REPORT")
         click.echo("="*70 + "\n")
-        
-        # Get metrics from Neo4j
+
         performance = self.neo4j.get_performance_summary(state["session_id"])
         weaknesses = self.neo4j.get_weaknesses_and_improvements(state["session_id"])
-        
-        # Generate detailed feedback using LLM
+
+        # ── V2: Include persona in feedback prompt for role-specific advice ──
+        persona = state.get("interviewer_persona", "Technical Interviewer")
+
         feedback_prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are an interview coach providing detailed feedback.
+            ("system", f"""You are an interview coach providing detailed feedback for a {persona} interview.
 
 Create a comprehensive feedback report with:
 1. Overall performance summary
 2. Strengths (specific examples from their answers)
 3. Areas for improvement (detailed, actionable)
-4. Specific study recommendations with resources
+4. Specific study recommendations relevant to this role
 5. Interview readiness assessment
 
-Be encouraging but honest. Provide actionable next steps."""),
+Be encouraging but honest. Provide actionable next steps tailored to the {persona} role."""),
             ("user", """Interview Results:
-            
+
 Performance Metrics:
-- Technical Accuracy: {avg_technical}/5
-- Clarity: {avg_clarity}/5
-- Confidence: {avg_confidence}/5
-- Overall: {avg_overall}/5
+- Technical Accuracy: {{avg_technical}}/5
+- Clarity: {{avg_clarity}}/5
+- Confidence: {{avg_confidence}}/5
+- Overall: {{avg_overall}}/5
 
 Q&A History:
-{qa_summary}
+{{qa_summary}}
 
 Identified Weaknesses:
-{weaknesses}
+{{weaknesses}}
 
 Generate detailed feedback report.""")
         ])
-        
+
         qa_summary = "\n".join([
             f"Q{qa['question_id']}: {qa['question']}\nScore: {qa['overall_score']}/5\nFeedback: {qa['feedback']}\n"
             for qa in state["qa_history"]
         ])
-        
         weakness_summary = "\n".join([
             f"- {w['weakness']} (Severity: {w['severity']})\n  → {w['improvement']}"
             for w in weaknesses
         ]) if weaknesses else "None identified"
-        
+
         feedback_chain = feedback_prompt | self.llm | StrOutputParser()
         detailed_feedback = feedback_chain.invoke({
             "avg_technical": performance.get("avg_technical", 0),
@@ -835,7 +827,7 @@ Generate detailed feedback report.""")
             "qa_summary": qa_summary,
             "weaknesses": weakness_summary
         })
-        
+
         state["final_report"] = detailed_feedback
         state["overall_rating"] = performance.get("avg_overall", 0)
         state["individual_ratings"] = {
@@ -843,15 +835,10 @@ Generate detailed feedback report.""")
             "clarity": performance.get("avg_clarity", 0),
             "confidence": performance.get("avg_confidence", 0)
         }
-        
         return state
-    
+
     def run_interview(self, resume_path: str, jd_text: str, mode: str, session_id: str) -> Dict[str, Any]:
-        """Run complete interview flow"""
-        # Extract resume text
         resume_text = self.resume_parser.extract_text_from_pdf(resume_path)
-        
-        # Initialize state
         initial_state = {
             "resume_text": resume_text,
             "jd_text": jd_text,
@@ -866,101 +853,80 @@ Generate detailed feedback report.""")
             "user_id": "cli_user",
             "current_question": "",
             "current_answer": "",
+            "current_answer_cleaned": None,
+            "interviewer_persona": None,
             "final_report": None,
             "overall_rating": None,
             "individual_ratings": None
         }
-        
-        # Run state machine
-        final_state = self.graph.invoke(initial_state)
-        
-        return final_state
+        return self.graph.invoke(initial_state)
 
 # ===================================================================
 # CLI APPLICATION
 # ===================================================================
 
 @click.command()
-@click.option('--mode', type=click.Choice(['quick', 'standard']), default='standard', 
-              help='Interview mode: quick (10 min) or standard (20 min)')
-@click.option('--resume', type=click.Path(exists=True), required=True,
-              help='Path to resume PDF file')
-@click.option('--jd', type=str, required=True,
-              help='Job description (text or file path)')
+@click.option('--mode', type=click.Choice(['quick', 'standard']), default='standard')
+@click.option('--resume', type=click.Path(exists=True), required=True)
+@click.option('--jd', type=str, required=True)
 def main(mode: str, resume: str, jd: str):
     """AI-Powered Interview Platform - CLI Tool"""
-    
     click.clear()
     click.echo("="*70)
-    click.echo("🤖 AI-POWERED INTERVIEW PLATFORM - V1.0")
+    click.echo("🤖 AI-POWERED INTERVIEW PLATFORM - V2.0")
     click.echo("="*70)
     click.echo(f"\nMode: {mode.upper()}")
     click.echo(f"Resume: {resume}")
     click.echo(f"Duration: {Config.INTERVIEW_MODES[mode]['duration']} minutes")
     click.echo(f"Questions: {Config.INTERVIEW_MODES[mode]['questions']}")
-    click.echo(f"Interviewer Persona: {Config.INTERVIEW_MODES[mode]['persona']}\n")
-    
+    click.echo(f"Interviewer Persona: [Generated dynamically from JD]\n")
+
     if not click.confirm("Ready to start the interview?"):
         click.echo("Interview cancelled.")
         return
-    
-    # Read JD (check if it's a file or text)
+
     if os.path.isfile(jd):
-        with open(jd, 'r',encoding='utf-8') as f:
+        with open(jd, 'r', encoding='utf-8') as f:
             jd_text = f.read()
     else:
         jd_text = jd
-    
-    # Generate session ID
+
     session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    
+
     try:
-        # Initialize and run interview
         engine = InterviewEngine()
         final_state = engine.run_interview(resume, jd_text, mode, session_id)
-        
-        # Display final report
+
         click.echo("\n" + "="*70)
         click.echo("📋 FINAL PERFORMANCE REPORT")
         click.echo("="*70 + "\n")
-        
+        click.echo(f"Interviewer Persona: {final_state.get('interviewer_persona', 'N/A')}")
         click.echo(f"Overall Score: {final_state['overall_rating']:.1f}/5.0\n")
-        
         click.echo("Individual Ratings:")
         click.echo(f"  • Technical Accuracy: {final_state['individual_ratings']['technical']:.1f}/5.0")
         click.echo(f"  • Clarity: {final_state['individual_ratings']['clarity']:.1f}/5.0")
         click.echo(f"  • Confidence: {final_state['individual_ratings']['confidence']:.1f}/5.0")
-        
         click.echo("\n" + "-"*70 + "\n")
         click.echo(final_state['final_report'])
         click.echo("\n" + "="*70)
-        
-        # Close database connections
         engine.neo4j.close()
-        
+
     except Exception as e:
         click.echo(f"\n❌ Error: {str(e)}", err=True)
         import traceback
         traceback.print_exc()
 
-# ===================================================================
-# SETUP SCRIPT (Run this first to initialize databases)
-# ===================================================================
 
 @click.command()
 def setup():
     """Initialize Qdrant and Neo4j databases"""
     click.echo("🔧 Setting up databases...\n")
-    
-    # Test Qdrant connection
     try:
         qdrant = QdrantManager()
         click.echo("✓ Qdrant connected and collections created")
     except Exception as e:
         click.echo(f"❌ Qdrant error: {e}")
         return
-    
-    # Test Neo4j connection
     try:
         neo4j = Neo4jManager()
         click.echo("✓ Neo4j connected and constraints created")
@@ -968,23 +934,15 @@ def setup():
     except Exception as e:
         click.echo(f"❌ Neo4j error: {e}")
         return
-    
     click.echo("\n✅ All databases initialized successfully!")
-    click.echo("\nYou can now run the interview tool with:")
-    click.echo("  python interview_platform.py --resume your_resume.pdf --jd 'job description text'")
 
-# ===================================================================
-# ENTRY POINT
-# ===================================================================
 
 if __name__ == "__main__":
     import sys
-    
     if len(sys.argv) > 1 and sys.argv[1] == "setup":
         setup()
     else:
         main()
-
 
 # ===================================================================
 # REQUIREMENTS.txt

@@ -1,11 +1,13 @@
 """
-FastAPI Backend for AI Interview Platform
-Wraps the existing InterviewEngine with REST endpoints.
+FastAPI Backend for AI Interview Platform - Version 2
+Adds multi-provider LLM support (OpenAI, Anthropic, Gemini)
+and time-based interview sessions with custom duration.
 """
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional
 import tempfile
 import copy
 import os
@@ -14,7 +16,7 @@ from datetime import datetime
 
 from interview_platform import InterviewEngine, Config
 
-app = FastAPI(title="InterviewAI API", version="1.0.0")
+app = FastAPI(title="InterviewAI API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,15 +29,45 @@ app.add_middleware(
 sessions: dict = {}
 
 
+# ── LLM FACTORY ───────────────────────────────────────────────────
+
+def build_llm(provider: str, model: str, api_key: str):
+    provider = (provider or 'openai').lower()
+    if provider == 'openai':
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(model=model or 'gpt-4o', api_key=api_key or os.getenv('OPENAI_API_KEY'), temperature=0.7)
+    elif provider == 'anthropic':
+        from langchain_anthropic import ChatAnthropic
+        return ChatAnthropic(model=model or 'claude-sonnet-4-5', api_key=api_key or os.getenv('ANTHROPIC_API_KEY'), temperature=0.7)
+    elif provider == 'gemini':
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        return ChatGoogleGenerativeAI(model=model or 'gemini-1.5-pro', google_api_key=api_key or os.getenv('GOOGLE_API_KEY'), temperature=0.7)
+    else:
+        raise HTTPException(400, f"Unsupported provider: {provider}. Choose openai, anthropic, or gemini.")
+
+
+def inject_llm(engine: InterviewEngine, provider: str, model: str, api_key: str):
+    if not api_key:
+        return
+    llm = build_llm(provider, model, api_key)
+    if hasattr(engine, 'llm'):
+        engine.llm = llm
+    if hasattr(engine, '_build_chains'):
+        engine._build_chains()
+    print(f"[llm] Using {provider} / {model}")
+
+
 # ── MODELS ────────────────────────────────────────────────────────
+
 class StartSessionResponse(BaseModel):
     session_id: str
     mode: str
-    max_questions: int
+    duration: int          # minutes — used by frontend timer
     persona: str
-    duration: int
     resume_summary: dict
     jd_summary: dict
+    llm_provider: str
+    llm_model: str
 
 class AnswerRequest(BaseModel):
     answer: str
@@ -65,14 +97,9 @@ class ReportResponse(BaseModel):
     weaknesses: list
 
 
-# ── HELPERS ───────────────────────────────────────────────────────
+# ── CLEANUP HELPER ────────────────────────────────────────────────
 
 def _delete_session_data(engine: InterviewEngine, session_id: str):
-    """
-    Fix 4: Delete all data for this session from both Neo4j and Qdrant.
-    Called when the session ends so no stale data accumulates.
-    """
-    # ── Neo4j: delete all nodes related to this session ───────────
     try:
         driver = engine.neo4j._new_driver()
         with driver.session() as neo_session:
@@ -83,39 +110,29 @@ def _delete_session_data(engine: InterviewEngine, session_id: str):
                 OPTIONAL MATCH (u)-[:TARGETS]->(r:Requirement)
                 DETACH DELETE u, q, a, w, i, r
             """, session_id=session_id)
-            neo_session.run("""
-                MATCH (s:Skill)
-                WHERE NOT (s)--()
-                DELETE s
-            """)
-            print(f"[cleanup] Neo4j data deleted for {session_id}")
+            neo_session.run("MATCH (s:Skill) WHERE NOT (s)--() DELETE s")
         driver.close()
+        print(f"[cleanup] Neo4j cleared for {session_id}")
     except Exception as e:
-        print(f"[cleanup] Neo4j delete warning for {session_id}: {e}")
-
-    # ── Qdrant: delete all points with matching session_id ─────────
+        print(f"[cleanup] Neo4j warning: {e}")
     try:
         from qdrant_client.models import Filter, FieldCondition, MatchValue
-        filter_condition = Filter(
-            must=[FieldCondition(key="session_id", match=MatchValue(value=session_id))]
-        )
-        for collection in ["resume_embeddings", "jd_embeddings", "qa_context"]:
+        f = Filter(must=[FieldCondition(key="session_id", match=MatchValue(value=session_id))])
+        for col in ["resume_embeddings", "jd_embeddings", "qa_context"]:
             try:
-                engine.qdrant.client.delete(
-                    collection_name=collection,
-                    points_selector=filter_condition,
-                )
+                engine.qdrant.client.delete(collection_name=col, points_selector=f)
             except Exception as e:
-                print(f"[cleanup] Qdrant delete warning ({collection}): {e}")
+                print(f"[cleanup] Qdrant warning ({col}): {e}")
+        print(f"[cleanup] Qdrant cleared for {session_id}")
     except Exception as e:
-        print(f"[cleanup] Qdrant cleanup warning for {session_id}: {e}")
+        print(f"[cleanup] Qdrant warning: {e}")
 
 
 # ── ENDPOINTS ─────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "1.0.0"}
+    return {"status": "ok", "version": "2.0.0"}
 
 
 @app.post("/session/start", response_model=StartSessionResponse)
@@ -123,9 +140,26 @@ async def start_session(
     resume: UploadFile = File(...),
     jd_text: str = Form(...),
     mode: str = Form("standard"),
+    custom_duration: Optional[int] = Form(None),
+    llm_provider: Optional[str] = Form(None),
+    llm_model: Optional[str] = Form(None),
+    llm_api_key: Optional[str] = Form(None),
 ):
-    if mode not in Config.INTERVIEW_MODES:
-        raise HTTPException(400, f"Invalid mode. Choose from: {list(Config.INTERVIEW_MODES.keys())}")
+    valid_modes = list(Config.INTERVIEW_MODES.keys()) + ["custom"]
+    if mode not in valid_modes:
+        raise HTTPException(400, f"Invalid mode. Choose from: {valid_modes}")
+
+    # Resolve duration
+    if mode == "custom":
+        if not custom_duration or not (5 <= custom_duration <= 60):
+            raise HTTPException(400, "custom_duration must be between 5 and 60 minutes.")
+        duration = custom_duration
+    else:
+        duration = custom_duration if (custom_duration and 5 <= custom_duration <= 60) \
+                   else Config.INTERVIEW_MODES[mode]["duration"]
+
+    # V2: time-based — no question ceiling
+    max_questions = 999
 
     suffix = os.path.splitext(resume.filename)[1] or ".pdf"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -135,25 +169,28 @@ async def start_session(
 
     try:
         session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-        mode_config = Config.INTERVIEW_MODES[mode]
 
         engine = InterviewEngine()
+        inject_llm(engine, llm_provider or 'openai', llm_model or '', llm_api_key or '')
+
         resume_text = engine.resume_parser.extract_text_from_pdf(tmp_path)
 
         initial_state = {
             "resume_text": resume_text,
             "jd_text": jd_text,
-            "interview_mode": mode,
+            "interview_mode": mode if mode != "custom" else "standard",
             "resume_data": None,
             "jd_requirements": None,
             "current_question_num": 0,
-            "max_questions": 0,
+            "max_questions": max_questions,
             "questions_asked": [],
             "qa_history": [],
             "session_id": session_id,
             "user_id": "web_user",
             "current_question": "",
             "current_answer": "",
+            "current_answer_cleaned": None,
+            "interviewer_persona": None,
             "final_report": None,
             "overall_rating": None,
             "individual_ratings": None,
@@ -164,14 +201,20 @@ async def start_session(
         state = engine.plan_interview_node(state)
         state = engine.generate_question_node(state)
 
-        sessions[session_id] = {"engine": engine, "state": state, "mode": mode}
+        sessions[session_id] = {
+            "engine": engine,
+            "state": state,
+            "mode": mode,
+            "duration": duration,
+            "llm_provider": llm_provider or 'openai',
+            "llm_model": llm_model or '',
+        }
 
         return StartSessionResponse(
             session_id=session_id,
             mode=mode,
-            max_questions=state["max_questions"],
-            persona=mode_config["persona"],
-            duration=mode_config["duration"],
+            duration=duration,
+            persona=state.get("interviewer_persona", "Technical Interviewer"),
             resume_summary={
                 "skills": state["resume_data"]["skills"],
                 "experience_years": state["resume_data"]["experience_years"],
@@ -182,6 +225,8 @@ async def start_session(
                 "experience_level": state["jd_requirements"]["experience_level"],
                 "summary": state["jd_requirements"]["summary"],
             },
+            llm_provider=llm_provider or 'openai',
+            llm_model=llm_model or '',
         )
     finally:
         os.unlink(tmp_path)
@@ -191,13 +236,12 @@ async def start_session(
 def get_current_question(session_id: str):
     if session_id not in sessions:
         raise HTTPException(404, "Session not found")
-    sess = sessions[session_id]
-    state = sess["state"]
+    state = sessions[session_id]["state"]
     return NextQuestionResponse(
         question_id=state["current_question_num"],
         question=state["current_question"],
         total_questions=state["max_questions"],
-        interview_complete=state["current_question_num"] > state["max_questions"],
+        interview_complete=False,  # V2: timer-driven, not question-count driven
     )
 
 
@@ -211,16 +255,16 @@ def submit_answer(session_id: str, body: AnswerRequest):
     state = copy.deepcopy(sess["state"])
 
     state["current_answer"] = body.answer
+    state["current_answer_cleaned"] = None
+
+    # V2: clean → evaluate → next question (always — timer controls the end)
+    state = engine.clean_response_node(state)
     state = engine.evaluate_answer_node(state)
-
-    latest_qa = state["qa_history"][-1]
-    is_done = state["current_question_num"] >= state["max_questions"]
-
-    if not is_done:
-        state = engine.adaptation_node(state)
-        state = engine.generate_question_node(state)
+    state = engine.adaptation_node(state)
+    state = engine.generate_question_node(state)
 
     sess["state"] = state
+    latest_qa = state["qa_history"][-1]
 
     return AnswerResponse(
         question_id=latest_qa["question_id"],
@@ -230,8 +274,28 @@ def submit_answer(session_id: str, body: AnswerRequest):
         confidence_score=latest_qa["confidence_score"],
         overall_score=latest_qa["overall_score"],
         feedback=latest_qa["feedback"],
-        interview_complete=is_done,
+        interview_complete=False,  # V2: always false — frontend timer decides
     )
+
+
+@app.post("/session/{session_id}/end")
+def end_interview_early(session_id: str):
+    """
+    V2: Called by frontend when user clicks End Interview OR timer expires after final answer.
+    Pre-generates the report so /report returns instantly.
+    """
+    if session_id not in sessions:
+        raise HTTPException(404, "Session not found")
+
+    sess = sessions[session_id]
+    engine: InterviewEngine = sess["engine"]
+    state = copy.deepcopy(sess["state"])
+
+    state = engine.generate_feedback_node(state)
+    sess["state"] = state
+
+    print(f"[end] {session_id} — {len(state['qa_history'])} questions answered")
+    return {"ended": True, "session_id": session_id, "questions_answered": len(state["qa_history"])}
 
 
 @app.get("/session/{session_id}/report", response_model=ReportResponse)
@@ -243,8 +307,10 @@ def get_report(session_id: str):
     engine: InterviewEngine = sess["engine"]
     state = copy.deepcopy(sess["state"])
 
-    state = engine.generate_feedback_node(state)
-    sess["state"] = state
+    # If /end was already called, report is pre-generated — skip regeneration
+    if not state.get("final_report"):
+        state = engine.generate_feedback_node(state)
+        sess["state"] = state
 
     performance = engine.neo4j.get_performance_summary(session_id)
     weaknesses = engine.neo4j.get_weaknesses_and_improvements(session_id)
@@ -260,14 +326,9 @@ def get_report(session_id: str):
 
 
 @app.delete("/session/{session_id}")
-def end_session(session_id: str):
-    """
-    Fix 4: Clean up session — delete all data from Neo4j + Qdrant,
-    then remove from in-memory store.
-    """
+def delete_session(session_id: str):
     if session_id in sessions:
         engine = sessions[session_id]["engine"]
-        # Delete all persisted data for this session
         _delete_session_data(engine, session_id)
         del sessions[session_id]
     return {"deleted": True, "session_id": session_id}
