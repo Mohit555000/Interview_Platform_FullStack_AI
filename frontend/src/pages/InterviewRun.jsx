@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { getCurrentQuestion, submitAnswer, endInterview } from '../api/client'
+import { getCurrentQuestion, submitAnswer, endInterview, transcribeAudio, speakText } from '../api/client'
 import './InterviewRun.css'
 
 const fmt = (s) => {
@@ -9,45 +9,274 @@ const fmt = (s) => {
   return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
 }
 
-const getTimerWarning = (elapsed, total) => {
-  const pct = elapsed / total
-  if (pct >= 0.95) return 'critical'
-  if (pct >= 0.80) return 'warning'
-  return null
+const TRANSITIONS = [
+  "Okay, let's move to the next question.",
+  "Got it. Here's the next one.",
+  "Thank you. Moving on.",
+  "Alright, next question.",
+  "Good. Let's continue.",
+]
+
+// ── Modern animated indicators (no emojis) ────────────────────────
+function OrbIndicator({ state }) {
+  return (
+    <div className={`voice-orb ${state}`}>
+      {/* Listening: pulse rings */}
+      {state === 'listening' && (
+        <div className="orb-listening">
+          <div className="pulse-ring r1" />
+          <div className="pulse-ring r2" />
+          <div className="pulse-ring r3" />
+          <div className="mic-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+              <line x1="12" y1="19" x2="12" y2="23"/>
+              <line x1="8" y1="23" x2="16" y2="23"/>
+            </svg>
+          </div>
+        </div>
+      )}
+
+      {/* Speaking: sound wave bars */}
+      {state === 'speaking' && (
+        <div className="orb-speaking">
+          {[1,2,3,4,5].map(i => (
+            <div key={i} className={`wave-bar b${i}`} />
+          ))}
+        </div>
+      )}
+
+      {/* Thinking: rotating arc */}
+      {state === 'thinking' && (
+        <div className="orb-thinking">
+          <svg viewBox="0 0 50 50" className="think-spinner">
+            <circle cx="25" cy="25" r="20" fill="none" stroke="currentColor" strokeWidth="3"
+              strokeLinecap="round" strokeDasharray="80 40" />
+          </svg>
+        </div>
+      )}
+
+      {/* Idle: static circle */}
+      {state === 'idle' && (
+        <div className="orb-idle">
+          <div className="idle-dot" />
+        </div>
+      )}
+    </div>
+  )
 }
 
 export default function InterviewRun() {
   const navigate = useNavigate()
-  const [session, setSession] = useState(null)
-  const [question, setQuestion] = useState(null)
-  const [answer, setAnswer] = useState('')
-  const [evaluation, setEvaluation] = useState(null)
-  const [loading, setLoading] = useState(false)
-  const [submitting, setSubmitting] = useState(false)
-  const [ending, setEnding] = useState(false)
-  const [error, setError] = useState('')
-  const [qaHistory, setQaHistory] = useState([])
-  const [showConfirm, setShowConfirm] = useState(false)
-  const [showEndConfirm, setShowEndConfirm] = useState(false)
-  const [pendingAnswer, setPendingAnswer] = useState('')
+  const [session, setSession]         = useState(null)
+  const [transcript, setTranscript]   = useState('')
+  const [aiState, setAiState]         = useState('idle')
+  const [qaHistory, setQaHistory]     = useState([])
+  const [error, setError]             = useState('')
+  const [questionNum, setQuestionNum] = useState(0)
 
-  const [elapsed, setElapsed] = useState(0)
-  const [totalSecs, setTotalSecs] = useState(0)
-  const [timerExpired, setTimerExpired] = useState(false)
-  const [warningShown, setWarningShown] = useState(null)
-  const timerRef = useRef(null)
-  const textareaRef = useRef(null)
+  // Timer
+  const [elapsed, setElapsed]           = useState(0)
+  const [totalSecs, setTotalSecs]       = useState(0)
+  const [warningLevel, setWarningLevel] = useState(null)
 
+  // Refs
+  const timerRef            = useRef(null)
+  const mediaRecorderRef    = useRef(null)
+  const audioChunksRef      = useRef([])
+  const analyserRef         = useRef(null)
+  const animFrameRef        = useRef(null)
+  const streamRef           = useRef(null)
+  const warningSpokenRef    = useRef({ warning: false, critical: false })
+  const timerExpiredRef     = useRef(false)
+  const sessionRef          = useRef(null)
+  const questionRef         = useRef(null)
+  const qaHistoryRef        = useRef([])
+  const aiStateRef          = useRef('idle')
+  const isRecordingRef      = useRef(false)
+  const hasBootedRef        = useRef(false)
+  // ── Fix 1: track if currently in the middle of answering ─────────
+  const isAnsweringRef      = useRef(false)
+  const lastWarningLevelRef = useRef(null)
+
+  const setAiStateSynced = useCallback((s) => {
+    aiStateRef.current = s
+    setAiState(s)
+  }, [])
+
+  // ── TTS ──────────────────────────────────────────────────────────
+  const speak = useCallback(async (text) => {
+    setAiStateSynced('speaking')
+    try {
+      const audioBlob = await speakText(text)
+      const url = URL.createObjectURL(audioBlob)
+      await new Promise((resolve) => {
+        const audio = new Audio(url)
+        audio.onended = () => { URL.revokeObjectURL(url); resolve() }
+        audio.onerror = () => { URL.revokeObjectURL(url); resolve() }
+        audio.play().catch(resolve)
+      })
+    } catch (err) {
+      console.error('TTS error:', err)
+    }
+  }, [setAiStateSynced])
+
+  // ── Silence detection ────────────────────────────────────────────
+  const startSilenceDetection = useCallback((stream, onSilence) => {
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)()
+    const source   = audioCtx.createMediaStreamSource(stream)
+    const analyser = audioCtx.createAnalyser()
+    analyser.fftSize = 512
+    source.connect(analyser)
+    analyserRef.current = analyser
+
+    const data = new Uint8Array(analyser.frequencyBinCount)
+    let silenceStart = null
+    const SILENCE_THRESHOLD = 10
+    const SILENCE_DURATION  = 5000
+
+    const check = () => {
+      if (!isRecordingRef.current) return
+      analyser.getByteTimeDomainData(data)
+      const rms = Math.sqrt(data.reduce((s, v) => s + (v - 128) ** 2, 0) / data.length)
+      if (rms < SILENCE_THRESHOLD) {
+        if (!silenceStart) silenceStart = Date.now()
+        else if (Date.now() - silenceStart >= SILENCE_DURATION) {
+          isRecordingRef.current = false
+          audioCtx.close()
+          onSilence()
+          return
+        }
+      } else {
+        silenceStart = null
+      }
+      animFrameRef.current = requestAnimationFrame(check)
+    }
+    animFrameRef.current = requestAnimationFrame(check)
+  }, [])
+
+  // ── Submit answer ────────────────────────────────────────────────
+  const handleVoiceSubmit = useCallback(async (text) => {
+    isAnsweringRef.current = false   // done answering
+    setAiStateSynced('thinking')
+    try {
+      const sess = sessionRef.current
+      const result = await submitAnswer(sess.session_id, text)
+      const newEntry = { question: questionRef.current?.question, answer: text, ...result }
+      const updated  = [...qaHistoryRef.current, newEntry]
+      qaHistoryRef.current = updated
+      setQaHistory(updated)
+
+      // ── Fix 1: check timer AFTER submitting answer ────────────────
+      // If timer expired while user was answering, wrap up now
+      if (timerExpiredRef.current) {
+        await speak("Thank you for your time. I'll now generate your interview report.")
+        await endInterview(sess.session_id)
+        navigate('/interview/report')
+        return
+      }
+
+      // ── Speak warning between questions (not mid-answer) ──────────
+      if (lastWarningLevelRef.current === 'critical' && !warningSpokenRef.current.criticalSpoken) {
+        warningSpokenRef.current.criticalSpoken = true
+        await speak("We're in the final stage. This will be our last question.")
+      }
+
+      const transition = TRANSITIONS[Math.floor(Math.random() * TRANSITIONS.length)]
+      await speak(transition)
+      await loadAndSpeakNextQuestion()
+
+    } catch (err) {
+      console.error('Submit error:', err)
+      setError('Something went wrong. Listening again...')
+      await new Promise(r => setTimeout(r, 2000))
+      setError('')
+      isAnsweringRef.current = true
+      await startListening()
+    }
+  }, [speak, navigate, setAiStateSynced])
+
+  // ── Start listening ──────────────────────────────────────────────
+  const startListening = useCallback(async () => {
+    setTranscript('')
+    audioChunksRef.current = []
+    setAiStateSynced('listening')
+    isAnsweringRef.current = true   // user is now answering
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      streamRef.current = stream
+      isRecordingRef.current = true
+
+      const mediaRecorder = new MediaRecorder(stream)
+      mediaRecorderRef.current = mediaRecorder
+
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunksRef.current.push(e.data)
+      }
+
+      mediaRecorder.onstop = async () => {
+        stream.getTracks().forEach(t => t.stop())
+        const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' })
+        try {
+          const sess = sessionRef.current
+          const result = await transcribeAudio(sess.session_id, blob)
+          const text = result.transcript?.trim()
+          if (!text) {
+            await speak("I didn't catch that. Could you please repeat your answer?")
+            isAnsweringRef.current = true
+            await startListening()
+            return
+          }
+          setTranscript(text)
+          await handleVoiceSubmit(text)
+        } catch (err) {
+          console.error('Transcription error:', err)
+          setError('Having trouble hearing you. Please speak again.')
+          await speak("Sorry, I had trouble hearing that. Please try again.")
+          setError('')
+          isAnsweringRef.current = true
+          await startListening()
+        }
+      }
+
+      mediaRecorder.start(100)
+      startSilenceDetection(stream, () => {
+        if (mediaRecorder.state !== 'inactive') mediaRecorder.stop()
+      })
+
+    } catch (err) {
+      setError('Microphone access denied. Please allow microphone and refresh.')
+      setAiStateSynced('idle')
+    }
+  }, [setAiStateSynced, speak, startSilenceDetection, handleVoiceSubmit])
+
+  // ── Load + speak next question ───────────────────────────────────
+  const loadAndSpeakNextQuestion = useCallback(async () => {
+    try {
+      const sess = sessionRef.current
+      const q = await getCurrentQuestion(sess.session_id)
+      questionRef.current = q
+      setQuestionNum(q.question_id)
+      setTranscript('')
+      await speak(q.question)
+      await startListening()
+    } catch (err) {
+      setError('Failed to load next question.')
+    }
+  }, [speak, startListening])
+
+  // ── Timer ─────────────────────────────────────────────────────────
   const startTimer = useCallback((durationMinutes) => {
     const total = durationMinutes * 60
     setTotalSecs(total)
-    setElapsed(0)
     timerRef.current = setInterval(() => {
       setElapsed(prev => {
         const next = prev + 1
         if (next >= total) {
           clearInterval(timerRef.current)
-          setTimerExpired(true)
+          timerExpiredRef.current = true
           return total
         }
         return next
@@ -55,158 +284,82 @@ export default function InterviewRun() {
     }, 1000)
   }, [])
 
+  // ── Warning thresholds — Fix 1: never interrupt mid-answer ───────
+  useEffect(() => {
+    if (!totalSecs) return
+    const pct = elapsed / totalSecs
+
+    if (pct >= 0.95 && !warningSpokenRef.current.critical) {
+      warningSpokenRef.current.critical = true
+      lastWarningLevelRef.current = 'critical'
+      setWarningLevel('critical')
+      // Only interrupt if NOT currently answering
+      // If answering, warning will be spoken after the answer is submitted
+      if (!isAnsweringRef.current && aiStateRef.current !== 'thinking') {
+        speak("We're almost out of time. This will be our last question.").then(() => {
+          loadAndSpeakNextQuestion()
+        })
+      }
+    } else if (pct >= 0.80 && !warningSpokenRef.current.warning) {
+      warningSpokenRef.current.warning = true
+      lastWarningLevelRef.current = 'warning'
+      setWarningLevel('warning')
+    }
+  }, [elapsed, totalSecs])
+
+  // ── Boot ──────────────────────────────────────────────────────────
   useEffect(() => {
     const raw = sessionStorage.getItem('interviewSession')
     if (!raw) { navigate('/interview'); return }
     const sess = JSON.parse(raw)
     setSession(sess)
-    fetchQuestion(sess.session_id)
+    sessionRef.current = sess
     startTimer(sess.duration)
-    return () => clearInterval(timerRef.current)
+
+    const boot = async () => {
+      if (hasBootedRef.current) return
+      hasBootedRef.current = true
+      const persona = sess.persona || 'your interviewer'
+      await speak(`Hello! I'm your ${persona} today. Let's begin the interview.`)
+      await loadAndSpeakNextQuestion()
+    }
+    boot()
+
+    return () => {
+      clearInterval(timerRef.current)
+      cancelAnimationFrame(animFrameRef.current)
+      isRecordingRef.current = false
+      streamRef.current?.getTracks().forEach(t => t.stop())
+    }
   }, [])
 
-  useEffect(() => {
-    if (!totalSecs) return
-    const level = getTimerWarning(elapsed, totalSecs)
-    if (level === 'critical' && warningShown !== 'critical') setWarningShown('critical')
-    else if (level === 'warning' && warningShown === null) setWarningShown('warning')
-  }, [elapsed, totalSecs])
-
-  const fetchQuestion = async (sessionId) => {
-    setLoading(true)
-    try {
-      const q = await getCurrentQuestion(sessionId)
-      setQuestion(q)
-      setEvaluation(null)
-      setAnswer('')
-      setTimeout(() => textareaRef.current?.focus(), 100)
-    } catch (err) {
-      setError('Failed to load question.')
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  const handleSubmitClick = (overrideAnswer) => {
-    const finalAnswer = overrideAnswer ?? answer.trim()
-    if (!finalAnswer) { textareaRef.current?.focus(); return }
-    setPendingAnswer(finalAnswer)
-    setShowConfirm(true)
-  }
-
-  const handleConfirm = async () => {
-    setShowConfirm(false)
-    setSubmitting(true)
-    setError('')
-    try {
-      const result = await submitAnswer(session.session_id, pendingAnswer)
-      setEvaluation(result)
-      const newEntry = { question: question.question, answer: pendingAnswer, ...result }
-      const updated = [...qaHistory, newEntry]
-      setQaHistory(updated)
-      if (timerExpired) {
-        sessionStorage.setItem('qaHistory', JSON.stringify(updated))
-        clearInterval(timerRef.current)
-        await endInterview(session.session_id)
-        setTimeout(() => navigate('/interview/report'), 1200)
-      }
-    } catch (err) {
-      setError('Failed to submit answer. Please try again.')
-    } finally {
-      setSubmitting(false)
-    }
-  }
-
-  const handleModify = () => {
-    setShowConfirm(false)
-    setTimeout(() => {
-      textareaRef.current?.focus()
-      const len = textareaRef.current?.value?.length || 0
-      textareaRef.current?.setSelectionRange(len, len)
-    }, 50)
-  }
-
-  const handleEndInterview = async () => {
-    setShowEndConfirm(false)
-    setEnding(true)
-    clearInterval(timerRef.current)
-    try {
-      await endInterview(session.session_id)
-      navigate('/interview/report')
-    } catch (err) {
-      setError('Failed to end interview. Please try again.')
-      setEnding(false)
-    }
-  }
-
-  const handleDontKnow = () => handleSubmitClick("I don't know")
-
-  const handleNext = () => {
-    if (timerExpired) { navigate('/interview/report'); return }
-    setEvaluation(null)
-    fetchQuestion(session.session_id)
-  }
-
-  const handleKeyDown = (e) => {
-    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) handleSubmitClick()
-  }
-
-  const remaining = Math.max(totalSecs - elapsed, 0)
+  // ── Derived ───────────────────────────────────────────────────────
+  const remaining   = Math.max(totalSecs - elapsed, 0)
   const progressPct = totalSecs ? Math.min((elapsed / totalSecs) * 100, 100) : 0
-  const avgScore = qaHistory.length
+  const timerColor  = warningLevel === 'critical' ? 'var(--red)'
+    : warningLevel === 'warning' ? '#f59e0b' : 'var(--text)'
+
+  const stateLabel = {
+    speaking:  'AI Speaking',
+    listening: 'Listening',
+    thinking:  'Analyzing',
+    idle:      'Starting',
+  }[aiState] || 'Starting'
+
+  const avgScore   = qaHistory.length
     ? (qaHistory.reduce((a, b) => a + b.overall_score, 0) / qaHistory.length).toFixed(1)
     : null
   const scoreColor = (s) => s >= 4 ? 'var(--green)' : s >= 3 ? 'var(--accent)' : 'var(--red)'
-  const timerColor = warningShown === 'critical' ? 'var(--red)' : warningShown === 'warning' ? '#f59e0b' : 'var(--text)'
 
   return (
-    <div className="run-page">
+    <div className="run-page voice-mode">
 
-      {showConfirm && (
-        <div className="confirm-overlay">
-          <div className="confirm-modal">
-            <div className="confirm-icon">📝</div>
-            <div className="confirm-title">Ready to submit?</div>
-            <div className="confirm-subtitle">Review your answer before it's evaluated.</div>
-            <div className="confirm-answer-preview">
-              {pendingAnswer === "I don't know"
-                ? <span style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>I don't know</span>
-                : pendingAnswer}
-            </div>
-            <div className="confirm-actions">
-              <button className="btn-ghost confirm-modify" onClick={handleModify}>✏ Modify Answer</button>
-              <button className="btn-primary confirm-submit" onClick={handleConfirm}>Submit Answer →</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {showEndConfirm && (
-        <div className="confirm-overlay">
-          <div className="confirm-modal">
-            <div className="confirm-icon">🏁</div>
-            <div className="confirm-title">End interview?</div>
-            <div className="confirm-subtitle">
-              You've answered {qaHistory.length} question{qaHistory.length !== 1 ? 's' : ''}.
-              Your report will be generated from answers so far.
-            </div>
-            <div className="confirm-actions">
-              <button className="btn-ghost confirm-modify" onClick={() => setShowEndConfirm(false)}>Keep Going</button>
-              <button className="btn-primary confirm-submit" onClick={handleEndInterview}
-                style={{ background: 'var(--red)', borderColor: 'var(--red)' }}>
-                End & Get Report →
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
+      {/* HEADER */}
       <div className="run-header">
         <div className="run-header-left">
           <div className="run-mode-badge">{session?.mode?.toUpperCase()} MODE</div>
           <span className="run-persona">Interviewer: {session?.persona}</span>
         </div>
-
         <div className="run-timer-wrap">
           <div className="run-timer-block">
             <div className="run-timer-label">Elapsed</div>
@@ -214,167 +367,79 @@ export default function InterviewRun() {
           </div>
           <div className="run-timer-track-wrap">
             <div className="run-timer-track">
-              <div className={`run-timer-fill ${warningShown || ''}`} style={{ width: `${progressPct}%` }} />
+              <div className={`run-timer-fill ${warningLevel || ''}`} style={{ width: `${progressPct}%` }} />
             </div>
-            {timerExpired && <div className="run-timer-expired-label">Time's up — finish your answer</div>}
           </div>
           <div className="run-timer-block">
             <div className="run-timer-label">Remaining</div>
             <div className="run-timer-val" style={{ color: timerColor }}>{fmt(remaining)}</div>
           </div>
         </div>
-
-        <button className="run-end-btn" onClick={() => setShowEndConfirm(true)} disabled={ending || submitting}>
-          {ending ? 'Ending…' : 'End Interview'}
-        </button>
+        <div className={`voice-state-badge ${aiState}`}>
+          <span className="vsb-dot" />
+          {stateLabel}
+        </div>
       </div>
 
-      {warningShown === 'critical' && !timerExpired && (
-        <div className="timer-banner critical">
-          🔴 Final stage — complete your current answer, the interview is about to end.
-        </div>
+      {/* WARNING BANNERS */}
+      {warningLevel === 'critical' && (
+        <div className="timer-banner critical">Final question — wrapping up soon.</div>
       )}
-      {warningShown === 'warning' && warningShown !== 'critical' && !timerExpired && (
-        <div className="timer-banner warning">
-          ⚠️ Interview entering final stage — {fmt(remaining)} remaining.
-        </div>
-      )}
-      {timerExpired && (
-        <div className="timer-banner expired">
-          ⏱ Time's up! Complete your current answer to generate your report.
-        </div>
+      {warningLevel === 'warning' && warningLevel !== 'critical' && (
+        <div className="timer-banner warning">Interview entering final stage — {fmt(remaining)} remaining.</div>
       )}
 
-      <div className="run-body">
-        <div className="run-main">
-          {loading ? (
-            <div className="run-loading">
-              <span className="spinner" style={{ width: 24, height: 24, borderColor: 'rgba(232,168,56,0.2)', borderTopColor: 'var(--accent)' }} />
-              <span style={{ fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--text-dim)', marginLeft: 12 }}>Loading next question…</span>
+      {/* VOICE STAGE — no question text on screen */}
+      <div className="voice-stage">
+        <div className="voice-center">
+              {/* Question text */}
+    {question && (
+      <div className="voice-question-text">
+        {question.question}
+      </div>
+    )}
+
+          <OrbIndicator state={aiState} />
+
+          <div className={`voice-state-label ${aiState}`}>{stateLabel}</div>
+
+          {/* Live transcript */}
+          {transcript && (
+            <div className="voice-transcript">
+              <div className="voice-transcript-label">Your answer</div>
+              <div className="voice-transcript-text">{transcript}</div>
             </div>
-          ) : (
-            <>
-              <div className="question-meta">
-                Question
-                <span className="qm-sep">·</span>
-                <span className="qm-id">#{question?.question_id}</span>
-                {timerExpired && <span className="qm-final-badge">Final Question</span>}
-              </div>
+          )}
 
-              <div className="question-text">{question?.question}</div>
+          {questionNum > 0 && (
+            <div className="voice-qnum">Question {questionNum}</div>
+          )}
 
-              {!evaluation && (
-                <div className="answer-area">
-                  <div className="answer-label">Your Answer</div>
-                  <textarea
-                    ref={textareaRef}
-                    className="answer-input"
-                    placeholder="Type your answer here… (Ctrl+Enter to submit)"
-                    value={answer}
-                    onChange={e => setAnswer(e.target.value)}
-                    onKeyDown={handleKeyDown}
-                    rows={6}
-                  />
-                  <div className="answer-footer">
-                    <button className="dont-know-btn" onClick={handleDontKnow} disabled={submitting}>I don't know →</button>
-                    <button className="submit-btn" onClick={() => handleSubmitClick()} disabled={submitting || !answer.trim()}>
-                      {submitting ? <><span className="spinner" /> Evaluating…</> : <>Submit Answer ↵</>}
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {evaluation && (
-                <div className="eval-panel">
-                  <div className="eval-header">
-                    <div className="eval-title">{evaluation.is_dont_know ? '📝 Knowledge Gap Recorded' : '✅ Answer Evaluated'}</div>
-                    <div className="eval-score" style={{ color: scoreColor(evaluation.overall_score) }}>
-                      {evaluation.overall_score.toFixed(1)}<span className="eval-score-max">/5.0</span>
-                    </div>
-                  </div>
-                  {!evaluation.is_dont_know && (
-                    <div className="eval-scores-row">
-                      {[['Technical', evaluation.technical_score], ['Clarity', evaluation.clarity_score], ['Confidence', evaluation.confidence_score]].map(([label, score]) => (
-                        <div className="eval-score-item" key={label}>
-                          <div className="eval-score-label">{label}</div>
-                          <div className="eval-score-track">
-                            <div className="eval-score-fill" style={{ width: `${(score/5)*100}%`, background: scoreColor(score) }} />
-                          </div>
-                          <div className="eval-score-val" style={{ color: scoreColor(score) }}>{score.toFixed(1)}</div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                  <div className="eval-feedback">{evaluation.feedback}</div>
-                  {timerExpired ? (
-                    <div className="eval-done">
-                      <span className="spinner" style={{ width: 16, height: 16, borderColor: 'rgba(232,168,56,0.3)', borderTopColor: 'var(--accent)' }} />
-                      <span style={{ fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--text-dim)', marginLeft: 10 }}>Time up — preparing your report…</span>
-                    </div>
-                  ) : (
-                    <button className="btn-primary" style={{ fontSize: 12, padding: '10px 24px', marginTop: 4 }} onClick={handleNext}>
-                      Next Question →
-                    </button>
-                  )}
-                </div>
-              )}
-
-              {error && <div className="run-error">⚠️ {error}</div>}
-            </>
+          {error && (
+            <div className="run-error" style={{ maxWidth: 480, textAlign: 'center' }}>⚠️ {error}</div>
           )}
         </div>
+      </div>
 
-        <div className="run-sidebar">
-          <div className="sidebar-card">
-            <div className="sidebar-label">Session</div>
-            <div className="sidebar-session-id">{session?.session_id}</div>
-          </div>
-          <div className="sidebar-card">
-            <div className="sidebar-label">Questions Answered</div>
-            <div className="sidebar-big-score" style={{ color: 'var(--accent)' }}>
-              {qaHistory.length}
-              <span style={{ fontSize: 14, color: 'var(--text-muted)', fontFamily: 'var(--mono)', fontWeight: 300, marginLeft: 4 }}>answered</span>
-            </div>
-          </div>
+      {/* SCORE STRIP */}
+      {qaHistory.length > 0 && (
+        <div className="voice-score-strip">
+          <span className="voice-score-label">Questions answered: {qaHistory.length}</span>
           {avgScore && (
-            <div className="sidebar-card">
-              <div className="sidebar-label">Running Average</div>
-              <div className="sidebar-big-score" style={{ color: scoreColor(parseFloat(avgScore)) }}>
-                {avgScore}<span style={{ fontSize: 16, color: 'var(--text-muted)', fontFamily: 'var(--sans)', fontWeight: 300 }}>/5.0</span>
-              </div>
-            </div>
+            <span className="voice-score-avg" style={{ color: scoreColor(parseFloat(avgScore)) }}>
+              Avg: {avgScore}/5.0
+            </span>
           )}
-          {session?.resume_summary?.skills && (
-            <div className="sidebar-card">
-              <div className="sidebar-label">Candidate Skills</div>
-              <div className="topic-chips">
-                {session.resume_summary.skills.slice(0, 10).map(s => <span className="chip" key={s}>{s}</span>)}
-              </div>
-            </div>
-          )}
-          {session?.jd_summary?.required_skills && (
-            <div className="sidebar-card">
-              <div className="sidebar-label">JD Requirements</div>
-              <div className="topic-chips">
-                {session.jd_summary.required_skills.slice(0, 8).map(s => <span className="chip active" key={s}>{s}</span>)}
-              </div>
-            </div>
-          )}
-          {qaHistory.length > 0 && (
-            <div className="sidebar-card">
-              <div className="sidebar-label">Question History</div>
-              <div className="history-list">
-                {qaHistory.map((qa, i) => (
-                  <div className="history-item" key={i}>
-                    <div className="history-q">Q{qa.question_id}: {qa.question.slice(0, 60)}…</div>
-                    <div className="history-score" style={{ color: scoreColor(qa.overall_score) }}>{qa.overall_score.toFixed(1)}</div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
+          <div className="voice-score-dots">
+            {qaHistory.slice(-8).map((qa, i) => (
+              <div key={i} className="voice-score-dot"
+                style={{ background: scoreColor(qa.overall_score) }}
+                title={`Q${qa.question_id}: ${qa.overall_score}/5`}
+              />
+            ))}
+          </div>
         </div>
-      </div>
+      )}
     </div>
   )
 }

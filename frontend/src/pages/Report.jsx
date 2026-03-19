@@ -122,12 +122,13 @@ export default function Report() {
     try {
       const data = await getReport(sessionId)
       setReport(data)
-      await endSession(sessionId)
-      sessionStorage.removeItem('interviewSession')
-      sessionStorage.removeItem('qaHistory')
     } catch (err) {
       setError(err?.response?.data?.detail || 'Something went wrong while generating your report. Please try again.')
     } finally {
+      // ── Always clean up — regardless of success or failure ────────
+      endSession(sessionId).catch(e => console.warn('[cleanup] endSession warning:', e))
+      sessionStorage.removeItem('interviewSession')
+      sessionStorage.removeItem('qaHistory')
       setLoading(false)
     }
   }

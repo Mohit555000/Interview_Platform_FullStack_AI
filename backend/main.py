@@ -1,16 +1,17 @@
 """
 FastAPI Backend for AI Interview Platform - Version 2
-Adds multi-provider LLM support (OpenAI, Anthropic, Gemini)
-and time-based interview sessions with custom duration.
+Multi-provider LLM, time-based sessions, OpenAI TTS (fable), backend STT, JD PDF upload.
 """
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 import tempfile
 import copy
 import os
+import io
 import uuid
 from datetime import datetime
 
@@ -43,7 +44,7 @@ def build_llm(provider: str, model: str, api_key: str):
         from langchain_google_genai import ChatGoogleGenerativeAI
         return ChatGoogleGenerativeAI(model=model or 'gemini-1.5-pro', google_api_key=api_key or os.getenv('GOOGLE_API_KEY'), temperature=0.7)
     else:
-        raise HTTPException(400, f"Unsupported provider: {provider}. Choose openai, anthropic, or gemini.")
+        raise HTTPException(400, f"Unsupported provider: {provider}.")
 
 
 def inject_llm(engine: InterviewEngine, provider: str, model: str, api_key: str):
@@ -57,12 +58,22 @@ def inject_llm(engine: InterviewEngine, provider: str, model: str, api_key: str)
     print(f"[llm] Using {provider} / {model}")
 
 
+# ── PDF TEXT EXTRACTION ───────────────────────────────────────────
+
+def extract_pdf_text(file_path: str) -> str:
+    """Extract text from a PDF file using PyPDF2."""
+    import PyPDF2
+    with open(file_path, 'rb') as f:
+        reader = PyPDF2.PdfReader(f)
+        return "".join(page.extract_text() or "" for page in reader.pages)
+
+
 # ── MODELS ────────────────────────────────────────────────────────
 
 class StartSessionResponse(BaseModel):
     session_id: str
     mode: str
-    duration: int          # minutes — used by frontend timer
+    duration: int
     persona: str
     resume_summary: dict
     jd_summary: dict
@@ -96,8 +107,11 @@ class ReportResponse(BaseModel):
     performance_metrics: dict
     weaknesses: list
 
+class TTSRequest(BaseModel):
+    text: str
 
-# ── CLEANUP HELPER ────────────────────────────────────────────────
+
+# ── CLEANUP ───────────────────────────────────────────────────────
 
 def _delete_session_data(engine: InterviewEngine, session_id: str):
     try:
@@ -112,7 +126,6 @@ def _delete_session_data(engine: InterviewEngine, session_id: str):
             """, session_id=session_id)
             neo_session.run("MATCH (s:Skill) WHERE NOT (s)--() DELETE s")
         driver.close()
-        print(f"[cleanup] Neo4j cleared for {session_id}")
     except Exception as e:
         print(f"[cleanup] Neo4j warning: {e}")
     try:
@@ -135,10 +148,91 @@ def health():
     return {"status": "ok", "version": "2.0.0"}
 
 
+# ── TTS: OpenAI gpt-4o-mini-tts with fable voice ─────────────────
+# ── Consistent voice persona — initialized once at module level ───
+_TTS_INSTRUCTIONS = (
+    "You are a calm, professional technical interviewer. "
+    "Speak in a clear, measured, neutral British accent. "
+    "Maintain the exact same tone, pace, and pitch for every sentence. "
+    "Do not vary your energy level between greetings and questions."
+)
+@app.post("/tts")
+async def text_to_speech(body: TTSRequest):
+    """
+    Convert text to speech using OpenAI TTS (gpt-4o-mini-tts, fable voice).
+    Returns MP3 audio stream.
+    """
+    from openai import OpenAI
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+    response = client.audio.speech.create(
+        model="gpt-4o-mini-tts",
+        voice="fable",
+        input=body.text,
+        response_format="mp3",
+        instructions=_TTS_INSTRUCTIONS,
+    )
+
+    audio_bytes = response.content
+    return StreamingResponse(
+        io.BytesIO(audio_bytes),
+        media_type="audio/mpeg",
+        headers={"Content-Disposition": "inline; filename=speech.mp3"}
+    )
+
+
+# ── STT: Google Speech Recognition via speech_recognition lib ─────
+@app.post("/session/{session_id}/transcribe")
+async def transcribe_audio(session_id: str, audio: UploadFile = File(...)):
+    """
+    Transcribe audio blob using Google Speech Recognition.
+    Accepts WebM audio from MediaRecorder, converts to WAV, transcribes.
+    """
+    import speech_recognition as sr
+    from pydub import AudioSegment
+
+    if session_id not in sessions:
+        raise HTTPException(404, "Session not found")
+
+    # Save uploaded audio to temp file
+    suffix = os.path.splitext(audio.filename)[1] or ".webm"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        content = await audio.read()
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    wav_path = tmp_path + ".wav"
+    try:
+        # Convert WebM → WAV using pydub
+        audio_seg = AudioSegment.from_file(tmp_path)
+        audio_seg = audio_seg.set_channels(1).set_frame_rate(16000)
+        audio_seg.export(wav_path, format="wav")
+
+        # Transcribe with Google Speech Recognition
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(wav_path) as source:
+            audio_data = recognizer.record(source)
+
+        transcript = recognizer.recognize_google(audio_data)
+        return {"transcript": transcript}
+
+    except sr.UnknownValueError:
+        return {"transcript": ""}  # Nothing recognized — frontend handles empty
+    except sr.RequestError as e:
+        raise HTTPException(503, f"Google Speech Recognition unavailable: {e}")
+    except Exception as e:
+        raise HTTPException(500, f"Transcription error: {str(e)}")
+    finally:
+        os.unlink(tmp_path)
+        if os.path.exists(wav_path):
+            os.unlink(wav_path)
+
+
+# ── SESSION START ─────────────────────────────────────────────────
 @app.post("/session/start", response_model=StartSessionResponse)
 async def start_session(
     resume: UploadFile = File(...),
-    jd_text: str = Form(...),
+    jd_file: UploadFile = File(...),          # ← JD is now a PDF upload
     mode: str = Form("standard"),
     custom_duration: Optional[int] = Form(None),
     llm_provider: Optional[str] = Form(None),
@@ -149,31 +243,39 @@ async def start_session(
     if mode not in valid_modes:
         raise HTTPException(400, f"Invalid mode. Choose from: {valid_modes}")
 
-    # Resolve duration
     if mode == "custom":
         if not custom_duration or not (5 <= custom_duration <= 60):
             raise HTTPException(400, "custom_duration must be between 5 and 60 minutes.")
         duration = custom_duration
     else:
         duration = custom_duration if (custom_duration and 5 <= custom_duration <= 60) \
-                   else Config.INTERVIEW_MODES[mode]["duration"]
+                   else Config.INTERVIEW_MODES.get(mode, {}).get("duration", 20)
 
-    # V2: time-based — no question ceiling
     max_questions = 999
 
-    suffix = os.path.splitext(resume.filename)[1] or ".pdf"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        content = await resume.read()
-        tmp.write(content)
-        tmp_path = tmp.name
+    # Save resume PDF
+    resume_suffix = os.path.splitext(resume.filename)[1] or ".pdf"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=resume_suffix) as tmp:
+        tmp.write(await resume.read())
+        resume_path = tmp.name
+
+    # Save JD PDF and extract text
+    jd_suffix = os.path.splitext(jd_file.filename)[1] or ".pdf"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=jd_suffix) as tmp:
+        tmp.write(await jd_file.read())
+        jd_path = tmp.name
 
     try:
+        jd_text = extract_pdf_text(jd_path)
+        if not jd_text.strip():
+            raise HTTPException(400, "Could not extract text from JD PDF. Please ensure it is a text-based PDF.")
+
         session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
 
         engine = InterviewEngine()
         inject_llm(engine, llm_provider or 'openai', llm_model or '', llm_api_key or '')
 
-        resume_text = engine.resume_parser.extract_text_from_pdf(tmp_path)
+        resume_text = engine.resume_parser.extract_text_from_pdf(resume_path)
 
         initial_state = {
             "resume_text": resume_text,
@@ -229,7 +331,8 @@ async def start_session(
             llm_model=llm_model or '',
         )
     finally:
-        os.unlink(tmp_path)
+        os.unlink(resume_path)
+        os.unlink(jd_path)
 
 
 @app.get("/session/{session_id}/question", response_model=NextQuestionResponse)
@@ -241,7 +344,7 @@ def get_current_question(session_id: str):
         question_id=state["current_question_num"],
         question=state["current_question"],
         total_questions=state["max_questions"],
-        interview_complete=False,  # V2: timer-driven, not question-count driven
+        interview_complete=False,
     )
 
 
@@ -257,7 +360,6 @@ def submit_answer(session_id: str, body: AnswerRequest):
     state["current_answer"] = body.answer
     state["current_answer_cleaned"] = None
 
-    # V2: clean → evaluate → next question (always — timer controls the end)
     state = engine.clean_response_node(state)
     state = engine.evaluate_answer_node(state)
     state = engine.adaptation_node(state)
@@ -274,26 +376,19 @@ def submit_answer(session_id: str, body: AnswerRequest):
         confidence_score=latest_qa["confidence_score"],
         overall_score=latest_qa["overall_score"],
         feedback=latest_qa["feedback"],
-        interview_complete=False,  # V2: always false — frontend timer decides
+        interview_complete=False,
     )
 
 
 @app.post("/session/{session_id}/end")
 def end_interview_early(session_id: str):
-    """
-    V2: Called by frontend when user clicks End Interview OR timer expires after final answer.
-    Pre-generates the report so /report returns instantly.
-    """
     if session_id not in sessions:
         raise HTTPException(404, "Session not found")
-
     sess = sessions[session_id]
     engine: InterviewEngine = sess["engine"]
     state = copy.deepcopy(sess["state"])
-
     state = engine.generate_feedback_node(state)
     sess["state"] = state
-
     print(f"[end] {session_id} — {len(state['qa_history'])} questions answered")
     return {"ended": True, "session_id": session_id, "questions_answered": len(state["qa_history"])}
 
@@ -302,19 +397,14 @@ def end_interview_early(session_id: str):
 def get_report(session_id: str):
     if session_id not in sessions:
         raise HTTPException(404, "Session not found")
-
     sess = sessions[session_id]
     engine: InterviewEngine = sess["engine"]
     state = copy.deepcopy(sess["state"])
-
-    # If /end was already called, report is pre-generated — skip regeneration
     if not state.get("final_report"):
         state = engine.generate_feedback_node(state)
         sess["state"] = state
-
     performance = engine.neo4j.get_performance_summary(session_id)
-    weaknesses = engine.neo4j.get_weaknesses_and_improvements(session_id)
-
+    weaknesses  = engine.neo4j.get_weaknesses_and_improvements(session_id)
     return ReportResponse(
         session_id=session_id,
         overall_rating=state["overall_rating"] or 0,
@@ -327,8 +417,16 @@ def get_report(session_id: str):
 
 @app.delete("/session/{session_id}")
 def delete_session(session_id: str):
-    if session_id in sessions:
-        engine = sessions[session_id]["engine"]
-        _delete_session_data(engine, session_id)
-        del sessions[session_id]
+    sess = sessions.pop(session_id, None)   # safe — no KeyError
+    if sess:
+        # Session still in memory — full cleanup
+        _delete_session_data(sess["engine"], session_id)
+    else:
+        # Session already removed from memory (e.g. by /end endpoint)
+        # but DB data may still exist — create a temp engine to clean up
+        try:
+            engine = InterviewEngine()
+            _delete_session_data(engine, session_id)
+        except Exception as e:
+            print(f"[cleanup] Fallback cleanup warning: {e}")
     return {"deleted": True, "session_id": session_id}

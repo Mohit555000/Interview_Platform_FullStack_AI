@@ -1,19 +1,3 @@
-# ===================================================================
-# AI INTERVIEW PLATFORM - V1 COMPLETE CODEBASE
-# ===================================================================
-# This is a complete, runnable implementation with all components
-# organized in a single file for easy testing and understanding.
-# 
-# In production, split this into separate modules:
-# - main.py (CLI entry point)
-# - config.py (configuration)
-# - parsers.py (resume/JD parsing)
-# - interview_engine.py (LangGraph state machine)
-# - evaluator.py (answer evaluation)
-# - database.py (Qdrant/Neo4j setup)
-# - prompts.py (prompt templates)
-# ===================================================================
-
 import os
 import json
 from typing import TypedDict, List, Dict, Any, Optional
@@ -123,7 +107,6 @@ class InterviewState(TypedDict):
     # Current interaction
     current_question: str
     current_answer: str
-    current_answer_cleaned: Optional[str]
 
     # ── V2: Dynamic interviewer persona ──────────────────────────
     interviewer_persona: Optional[str]
@@ -462,7 +445,6 @@ class InterviewEngine:
         workflow.add_node("plan_interview", self.plan_interview_node)
         workflow.add_node("generate_question", self.generate_question_node)
         workflow.add_node("get_answer", self.get_answer_node)
-        workflow.add_node("clean_response", self.clean_response_node)
         workflow.add_node("evaluate_answer", self.evaluate_answer_node)
         workflow.add_node("adapt", self.adaptation_node)
         workflow.add_node("generate_feedback", self.generate_feedback_node)
@@ -471,8 +453,7 @@ class InterviewEngine:
         workflow.add_edge("parse_jd", "plan_interview")
         workflow.add_edge("plan_interview", "generate_question")
         workflow.add_edge("generate_question", "get_answer")
-        workflow.add_edge("get_answer", "clean_response")        # ← new
-        workflow.add_edge("clean_response", "evaluate_answer")   # ← new
+        workflow.add_edge("get_answer", "evaluate_answer")
         workflow.add_edge("evaluate_answer", "adapt")
         workflow.add_conditional_edges(
             "adapt", self.should_continue,
@@ -605,58 +586,6 @@ Generate ONE focused question relevant to this specific role. Be direct and clea
         answer = click.prompt("Your answer", type=str)
         state["current_answer"] = answer
         return state
-    def clean_response_node(self, state: InterviewState) -> InterviewState:
-        """
-            V2: Query Optimization Layer
-            Cleans and normalizes the user's answer before LLM evaluation.
-            Handles filler words, speech noise, incomplete sentences.
-            Original answer is preserved in current_answer.
-            Cleaned version stored in current_answer_cleaned.
-        """
-        original = state["current_answer"].strip()
-        # Skip cleaning for don't-know responses — no point optimizing them
-        if self._is_dont_know_response(original):
-            state["current_answer_cleaned"] = original
-            return state
-         # Skip cleaning for very short answers (less than 10 words)
-        if len(original.split()) < 10:
-            state["current_answer_cleaned"] = original
-            return state
-        clean_prompt = ChatPromptTemplate.from_messages([
-        ("system", """You are a technical interview response optimizer.Your job is to clean and improve a candidate's spoken/typed answer for accurate evaluation.
-
-        Rules:
-        1. Remove filler words: um, uh, like, you know, basically, literally, kind of, sort of, right, okay, so
-        2. Fix obvious speech-to-text errors and typos
-        3. Complete any clearly incomplete sentences
-        4. Preserve ALL technical content, terminology, and meaning exactly
-        5. Do NOT add new information or correct technical mistakes — only clean language
-        6. Do NOT change the candidate's actual knowledge level
-        7. Keep the same structure and flow
-
-        Return ONLY the cleaned answer text. No explanation, no preamble."""),
-            ("user", "Original answer:\n{answer}\n\nCleaned answer:")
-        ])
-        try:
-            clean_chain = clean_prompt | self.llm | StrOutputParser()
-            cleaned = clean_chain.invoke({"answer": original}).strip()
-
-            # Safety check — if cleaning produced something too different or empty, use original
-            if not cleaned or len(cleaned) < len(original) * 0.3:
-                cleaned = original
-
-            state["current_answer_cleaned"] = cleaned
-
-            # Log if significant changes were made
-            if cleaned != original:
-                click.echo("✓ Response optimized for evaluation")
-
-        except Exception:
-            # Always fall back to original if cleaning fails
-            state["current_answer_cleaned"] = original
-
-        return state
-
 
     def _is_dont_know_response(self, answer: str) -> bool:
         """Detect if the user is admitting they don't know the answer"""
@@ -672,6 +601,38 @@ Generate ONE focused question relevant to this specific role. Be direct and clea
         answer_lower = answer.strip().lower()
         return any(phrase in answer_lower for phrase in dont_know_phrases)
 
+    def clean_response_node(self, state: InterviewState) -> InterviewState:
+        """V2: Query Optimization — cleans filler words before evaluation."""
+        original = state["current_answer"].strip()
+
+        # Skip for short answers or don't-know responses
+        if self._is_dont_know_response(original) or len(original.split()) < 10:
+            state["current_answer_cleaned"] = original
+            return state
+
+        clean_prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are a technical interview response optimizer.
+            Clean the candidate's answer by:
+            1. Removing filler words: um, uh, like, you know, basically, literally, kind of, sort of
+            2. Fixing obvious speech-to-text errors and typos
+            3. Completing clearly incomplete sentences
+            4. Preserving ALL technical content and meaning exactly
+            5. Do NOT add new information or correct technical mistakes
+
+            Return ONLY the cleaned answer text. No explanation."""),
+            ("user", "Original answer:\n{answer}\n\nCleaned answer:")
+        ])
+
+        try:
+            clean_chain = clean_prompt | self.llm | StrOutputParser()
+            cleaned = clean_chain.invoke({"answer": original}).strip()
+            if not cleaned or len(cleaned) < len(original) * 0.3:
+                cleaned = original
+            state["current_answer_cleaned"] = cleaned
+        except Exception:
+            state["current_answer_cleaned"] = original
+
+        return state
     def evaluate_answer_node(self, state: InterviewState) -> InterviewState:
         """Node: Evaluate answer quality"""
         click.echo("\n⏳ Evaluating your answer...")
@@ -706,9 +667,9 @@ Return ONLY a JSON with: {{"is_off_topic": true/false, "reason": "brief explanat
         ])
         off_topic_chain = off_topic_prompt | self.llm | JsonOutputParser()
         off_topic_result = off_topic_chain.invoke({
-    "question": state["current_question"],
-    "answer": state.get("current_answer_cleaned") or state["current_answer"]
-})
+            "question": state["current_question"],
+            "answer": state["current_answer"]
+        })
 
         if off_topic_result.get("is_off_topic"):
             click.echo(f"\n⚠️  Off-topic detected: {off_topic_result['reason']} (continuing anyway)")
@@ -717,26 +678,26 @@ Return ONLY a JSON with: {{"is_off_topic": true/false, "reason": "brief explanat
         eval_prompt = ChatPromptTemplate.from_messages([
             ("system", """Evaluate this interview answer on a scale of 1-5:
 
-            1. Technical Accuracy (40% weight): Correctness, depth, best practices
-            2. Clarity (30% weight): Structure, examples, conciseness
-            3. Confidence (20% weight): Fluency, terminology usage
-            4. Problem-Solving (10% weight): Logical thinking, edge cases
+1. Technical Accuracy (40% weight): Correctness, depth, best practices
+2. Clarity (30% weight): Structure, examples, conciseness
+3. Confidence (20% weight): Fluency, terminology usage
+4. Problem-Solving (10% weight): Logical thinking, edge cases
 
-            Return ONLY a JSON:
-        {{
-        "technical_score": float,
-        "clarity_score": float,
-        "confidence_score": float,
-        "problem_solving_score": float,
-        "overall_score": float,
-        "feedback": "Brief feedback on what was good/missing"
-        }}"""),
-        ("user", "Question: {question}\n\nAnswer: {answer}")
+Return ONLY a JSON:
+{{
+    "technical_score": float,
+    "clarity_score": float,
+    "confidence_score": float,
+    "problem_solving_score": float,
+    "overall_score": float,
+    "feedback": "Brief feedback on what was good/missing"
+}}"""),
+            ("user", "Question: {question}\n\nAnswer: {answer}")
         ])
         eval_chain = eval_prompt | self.llm | JsonOutputParser()
         evaluation = eval_chain.invoke({
-        "question": state["current_question"],
-        "answer": state.get("current_answer_cleaned") or state["current_answer"]
+            "question": state["current_question"],
+            "answer": state["current_answer"]
         })
 
         qa_record = {
@@ -781,6 +742,22 @@ Return ONLY a JSON with: {{"is_off_topic": true/false, "reason": "brief explanat
         # ── V2: Include persona in feedback prompt for role-specific advice ──
         persona = state.get("interviewer_persona", "Technical Interviewer")
 
+        qa_summary = "\n".join([
+            f"Q{qa['question_id']}: {qa['question']}\nScore: {qa['overall_score']}/5\nFeedback: {qa['feedback']}\n"
+            for qa in state["qa_history"]
+        ])
+        weakness_summary = "\n".join([
+            f"- {w['weakness']} (Severity: {w['severity']})\n  → {w['improvement']}"
+            for w in weaknesses
+        ]) if weaknesses else "None identified"
+
+        avg_technical = performance.get("avg_technical", 0)
+        avg_clarity   = performance.get("avg_clarity", 0)
+        avg_confidence = performance.get("avg_confidence", 0)
+        avg_overall   = performance.get("avg_overall", 0)
+
+        # ── Fix: build user message as f-string to avoid ChatPromptTemplate
+        # variable substitution issues ({{}} rendering as literal {}) ──────
         feedback_prompt = ChatPromptTemplate.from_messages([
             ("system", f"""You are an interview coach providing detailed feedback for a {persona} interview.
 
@@ -792,41 +769,25 @@ Create a comprehensive feedback report with:
 5. Interview readiness assessment
 
 Be encouraging but honest. Provide actionable next steps tailored to the {persona} role."""),
-            ("user", """Interview Results:
+            ("user", f"""Interview Results:
 
 Performance Metrics:
-- Technical Accuracy: {{avg_technical}}/5
-- Clarity: {{avg_clarity}}/5
-- Confidence: {{avg_confidence}}/5
-- Overall: {{avg_overall}}/5
+- Technical Accuracy: {avg_technical}/5
+- Clarity: {avg_clarity}/5
+- Confidence: {avg_confidence}/5
+- Overall: {avg_overall}/5
 
 Q&A History:
-{{qa_summary}}
+{qa_summary}
 
 Identified Weaknesses:
-{{weaknesses}}
+{weakness_summary}
 
 Generate detailed feedback report.""")
         ])
 
-        qa_summary = "\n".join([
-            f"Q{qa['question_id']}: {qa['question']}\nScore: {qa['overall_score']}/5\nFeedback: {qa['feedback']}\n"
-            for qa in state["qa_history"]
-        ])
-        weakness_summary = "\n".join([
-            f"- {w['weakness']} (Severity: {w['severity']})\n  → {w['improvement']}"
-            for w in weaknesses
-        ]) if weaknesses else "None identified"
-
         feedback_chain = feedback_prompt | self.llm | StrOutputParser()
-        detailed_feedback = feedback_chain.invoke({
-            "avg_technical": performance.get("avg_technical", 0),
-            "avg_clarity": performance.get("avg_clarity", 0),
-            "avg_confidence": performance.get("avg_confidence", 0),
-            "avg_overall": performance.get("avg_overall", 0),
-            "qa_summary": qa_summary,
-            "weaknesses": weakness_summary
-        })
+        detailed_feedback = feedback_chain.invoke({})
 
         state["final_report"] = detailed_feedback
         state["overall_rating"] = performance.get("avg_overall", 0)
@@ -853,7 +814,6 @@ Generate detailed feedback report.""")
             "user_id": "cli_user",
             "current_question": "",
             "current_answer": "",
-            "current_answer_cleaned": None,
             "interviewer_persona": None,
             "final_report": None,
             "overall_rating": None,
@@ -943,62 +903,3 @@ if __name__ == "__main__":
         setup()
     else:
         main()
-
-# ===================================================================
-# REQUIREMENTS.txt
-# ===================================================================
-"""
-Save this as requirements.txt:
-
-openai==1.12.0
-langchain==0.1.10
-langchain-openai==0.0.8
-langgraph==0.0.26
-qdrant-client==1.7.3
-neo4j==5.17.0
-PyPDF2==3.0.1
-click==8.1.7
-pydantic==2.6.1
-numpy==1.26.4
-"""
-
-# ===================================================================
-# .env.example
-# ===================================================================
-"""
-Save this as .env and fill in your credentials:
-
-OPENAI_API_KEY=your-openai-api-key-here
-QDRANT_HOST=localhost
-QDRANT_PORT=6333
-NEO4J_URI=bolt://localhost:7687
-NEO4J_USER=neo4j
-NEO4J_PASSWORD=your-neo4j-password
-"""
-
-# ===================================================================
-# SETUP INSTRUCTIONS
-# ===================================================================
-"""
-1. Install Docker and run Qdrant:
-   docker run -p 6333:6333 qdrant/qdrant
-
-2. Install Docker and run Neo4j:
-   docker run -p 7474:7474 -p 7687:7687 \
-   -e NEO4J_AUTH=neo4j/password \
-   neo4j:latest
-
-3. Install Python dependencies:
-   pip install -r requirements.txt
-
-4. Create .env file with your credentials
-
-5. Initialize databases:
-   python interview_platform.py setup
-
-6. Run interview:
-   python interview_platform.py --resume resume.pdf --jd "Software Engineer with Python expertise..."
-
-   Or with JD file:
-   python interview_platform.py --resume resume.pdf --jd job_description.txt --mode quick
-"""

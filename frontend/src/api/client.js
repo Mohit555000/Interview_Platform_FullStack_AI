@@ -13,27 +13,20 @@ export const getLlmHeaders = (apiKey = null) => {
 }
 
 /**
- * Start a new interview session.
- * llmConfig = { provider, model, apiKey } or null for platform default.
- * customDuration = number (minutes) or null for preset duration.
+ * Start session — now accepts jdFile (PDF) instead of jdText string.
+ * customDuration = number (minutes) or null for preset.
  */
-export const startSession = async (resumeFile, jdText, mode, llmConfig = null, customDuration = null) => {
+export const startSession = async (resumeFile, jdFile, mode, llmConfig = null, customDuration = null) => {
   const form = new FormData()
   form.append('resume', resumeFile)
-  form.append('jd_text', jdText)
+  form.append('jd_file', jdFile)          // ← PDF file now
   form.append('mode', mode)
-
-  // V2: pass custom duration if provided
-  if (customDuration) {
-    form.append('custom_duration', String(customDuration))
-  }
-
+  if (customDuration) form.append('custom_duration', String(customDuration))
   if (llmConfig) {
     form.append('llm_provider', llmConfig.provider)
     form.append('llm_model', llmConfig.model)
     form.append('llm_api_key', llmConfig.apiKey)
   }
-
   const { data } = await api.post('/session/start', form, {
     headers: { 'Content-Type': 'multipart/form-data' },
   })
@@ -55,17 +48,32 @@ export const getReport = async (sessionId) => {
   return data
 }
 
-/**
- * V2: End interview (timer expired or user clicked End).
- * Triggers report pre-generation on backend.
- */
 export const endInterview = async (sessionId) => {
   const { data } = await api.post(`/session/${sessionId}/end`)
   return data
 }
 
-/** Delete session data from DB (called from Nav / Report cleanup) */
 export const endSession = async (sessionId) => {
   const { data } = await api.delete(`/session/${sessionId}`)
   return data
+}
+
+/**
+ * STT: send audio blob → backend transcribes with Google Speech Recognition
+ */
+export const transcribeAudio = async (sessionId, audioBlob) => {
+  const form = new FormData()
+  form.append('audio', audioBlob, 'recording.webm')
+  const { data } = await api.post(`/session/${sessionId}/transcribe`, form, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  })
+  return data  // { transcript: string }
+}
+
+/**
+ * TTS: send text → backend returns MP3 audio blob (OpenAI fable voice)
+ */
+export const speakText = async (text) => {
+  const response = await api.post('/tts', { text }, { responseType: 'blob' })
+  return response.data  // audio/mpeg blob
 }
