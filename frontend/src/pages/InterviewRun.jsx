@@ -17,11 +17,9 @@ const TRANSITIONS = [
   "Good. Let's continue.",
 ]
 
-// ── Modern animated indicators (no emojis) ────────────────────────
 function OrbIndicator({ state }) {
   return (
     <div className={`voice-orb ${state}`}>
-      {/* Listening: pulse rings */}
       {state === 'listening' && (
         <div className="orb-listening">
           <div className="pulse-ring r1" />
@@ -37,17 +35,11 @@ function OrbIndicator({ state }) {
           </div>
         </div>
       )}
-
-      {/* Speaking: sound wave bars */}
       {state === 'speaking' && (
         <div className="orb-speaking">
-          {[1,2,3,4,5].map(i => (
-            <div key={i} className={`wave-bar b${i}`} />
-          ))}
+          {[1,2,3,4,5].map(i => <div key={i} className={`wave-bar b${i}`} />)}
         </div>
       )}
-
-      {/* Thinking: rotating arc */}
       {state === 'thinking' && (
         <div className="orb-thinking">
           <svg viewBox="0 0 50 50" className="think-spinner">
@@ -56,12 +48,8 @@ function OrbIndicator({ state }) {
           </svg>
         </div>
       )}
-
-      {/* Idle: static circle */}
       {state === 'idle' && (
-        <div className="orb-idle">
-          <div className="idle-dot" />
-        </div>
+        <div className="orb-idle"><div className="idle-dot" /></div>
       )}
     </div>
   )
@@ -70,13 +58,13 @@ function OrbIndicator({ state }) {
 export default function InterviewRun() {
   const navigate = useNavigate()
   const [session, setSession]         = useState(null)
+  const [question, setQuestion]       = useState(null)
   const [transcript, setTranscript]   = useState('')
   const [aiState, setAiState]         = useState('idle')
   const [qaHistory, setQaHistory]     = useState([])
   const [error, setError]             = useState('')
   const [questionNum, setQuestionNum] = useState(0)
 
-  // Timer
   const [elapsed, setElapsed]           = useState(0)
   const [totalSecs, setTotalSecs]       = useState(0)
   const [warningLevel, setWarningLevel] = useState(null)
@@ -96,25 +84,38 @@ export default function InterviewRun() {
   const aiStateRef          = useRef('idle')
   const isRecordingRef      = useRef(false)
   const hasBootedRef        = useRef(false)
-  // ── Fix 1: track if currently in the middle of answering ─────────
   const isAnsweringRef      = useRef(false)
   const lastWarningLevelRef = useRef(null)
+  const isMountedRef        = useRef(true)   // ← tracks if component is still mounted
+  const currentAudioRef     = useRef(null)   // ← tracks currently playing Audio object
 
   const setAiStateSynced = useCallback((s) => {
+    if (!isMountedRef.current) return
     aiStateRef.current = s
     setAiState(s)
   }, [])
 
   // ── TTS ──────────────────────────────────────────────────────────
   const speak = useCallback(async (text) => {
+    if (!isMountedRef.current) return   // ← don't speak if unmounted
     setAiStateSynced('speaking')
     try {
       const audioBlob = await speakText(text)
+      if (!isMountedRef.current) return  // ← check again after async call
       const url = URL.createObjectURL(audioBlob)
       await new Promise((resolve) => {
         const audio = new Audio(url)
-        audio.onended = () => { URL.revokeObjectURL(url); resolve() }
-        audio.onerror = () => { URL.revokeObjectURL(url); resolve() }
+        currentAudioRef.current = audio   // ← store reference
+        audio.onended = () => {
+          URL.revokeObjectURL(url)
+          currentAudioRef.current = null
+          resolve()
+        }
+        audio.onerror = () => {
+          URL.revokeObjectURL(url)
+          currentAudioRef.current = null
+          resolve()
+        }
         audio.play().catch(resolve)
       })
     } catch (err) {
@@ -133,8 +134,8 @@ export default function InterviewRun() {
 
     const data = new Uint8Array(analyser.frequencyBinCount)
     let silenceStart = null
-    const SILENCE_THRESHOLD = 10
-    const SILENCE_DURATION  = 5000
+    const SILENCE_THRESHOLD = 15
+    const SILENCE_DURATION  = 2000   // ← 2 seconds
 
     const check = () => {
       if (!isRecordingRef.current) return
@@ -158,39 +159,43 @@ export default function InterviewRun() {
 
   // ── Submit answer ────────────────────────────────────────────────
   const handleVoiceSubmit = useCallback(async (text) => {
-    isAnsweringRef.current = false   // done answering
+    if (!isMountedRef.current) return
+    isAnsweringRef.current = false
     setAiStateSynced('thinking')
     try {
       const sess = sessionRef.current
       const result = await submitAnswer(sess.session_id, text)
+      if (!isMountedRef.current) return
       const newEntry = { question: questionRef.current?.question, answer: text, ...result }
       const updated  = [...qaHistoryRef.current, newEntry]
       qaHistoryRef.current = updated
       setQaHistory(updated)
 
-      // ── Fix 1: check timer AFTER submitting answer ────────────────
-      // If timer expired while user was answering, wrap up now
       if (timerExpiredRef.current) {
         await speak("Thank you for your time. I'll now generate your interview report.")
+        if (!isMountedRef.current) return
         await endInterview(sess.session_id)
         navigate('/interview/report')
         return
       }
 
-      // ── Speak warning between questions (not mid-answer) ──────────
       if (lastWarningLevelRef.current === 'critical' && !warningSpokenRef.current.criticalSpoken) {
         warningSpokenRef.current.criticalSpoken = true
         await speak("We're in the final stage. This will be our last question.")
+        if (!isMountedRef.current) return
       }
 
       const transition = TRANSITIONS[Math.floor(Math.random() * TRANSITIONS.length)]
       await speak(transition)
+      if (!isMountedRef.current) return
       await loadAndSpeakNextQuestion()
 
     } catch (err) {
+      if (!isMountedRef.current) return
       console.error('Submit error:', err)
       setError('Something went wrong. Listening again...')
       await new Promise(r => setTimeout(r, 2000))
+      if (!isMountedRef.current) return
       setError('')
       isAnsweringRef.current = true
       await startListening()
@@ -199,13 +204,18 @@ export default function InterviewRun() {
 
   // ── Start listening ──────────────────────────────────────────────
   const startListening = useCallback(async () => {
+    if (!isMountedRef.current) return
     setTranscript('')
     audioChunksRef.current = []
     setAiStateSynced('listening')
-    isAnsweringRef.current = true   // user is now answering
+    isAnsweringRef.current = true
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      if (!isMountedRef.current) {
+        stream.getTracks().forEach(t => t.stop())
+        return
+      }
       streamRef.current = stream
       isRecordingRef.current = true
 
@@ -218,13 +228,16 @@ export default function InterviewRun() {
 
       mediaRecorder.onstop = async () => {
         stream.getTracks().forEach(t => t.stop())
+        if (!isMountedRef.current) return   // ← stop processing if unmounted
         const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' })
         try {
           const sess = sessionRef.current
           const result = await transcribeAudio(sess.session_id, blob)
+          if (!isMountedRef.current) return
           const text = result.transcript?.trim()
           if (!text) {
             await speak("I didn't catch that. Could you please repeat your answer?")
+            if (!isMountedRef.current) return
             isAnsweringRef.current = true
             await startListening()
             return
@@ -232,9 +245,11 @@ export default function InterviewRun() {
           setTranscript(text)
           await handleVoiceSubmit(text)
         } catch (err) {
+          if (!isMountedRef.current) return
           console.error('Transcription error:', err)
           setError('Having trouble hearing you. Please speak again.')
           await speak("Sorry, I had trouble hearing that. Please try again.")
+          if (!isMountedRef.current) return
           setError('')
           isAnsweringRef.current = true
           await startListening()
@@ -247,6 +262,7 @@ export default function InterviewRun() {
       })
 
     } catch (err) {
+      if (!isMountedRef.current) return
       setError('Microphone access denied. Please allow microphone and refresh.')
       setAiStateSynced('idle')
     }
@@ -254,15 +270,22 @@ export default function InterviewRun() {
 
   // ── Load + speak next question ───────────────────────────────────
   const loadAndSpeakNextQuestion = useCallback(async () => {
+    if (!isMountedRef.current) return
     try {
       const sess = sessionRef.current
       const q = await getCurrentQuestion(sess.session_id)
+      if (!isMountedRef.current) return
       questionRef.current = q
+      setQuestion(q)
       setQuestionNum(q.question_id)
       setTranscript('')
+      await new Promise(r => setTimeout(r, 50))  // let React render question text
+      if (!isMountedRef.current) return
       await speak(q.question)
+      if (!isMountedRef.current) return
       await startListening()
     } catch (err) {
+      if (!isMountedRef.current) return
       setError('Failed to load next question.')
     }
   }, [speak, startListening])
@@ -284,20 +307,17 @@ export default function InterviewRun() {
     }, 1000)
   }, [])
 
-  // ── Warning thresholds — Fix 1: never interrupt mid-answer ───────
+  // ── Warning thresholds ────────────────────────────────────────────
   useEffect(() => {
     if (!totalSecs) return
     const pct = elapsed / totalSecs
-
     if (pct >= 0.95 && !warningSpokenRef.current.critical) {
       warningSpokenRef.current.critical = true
       lastWarningLevelRef.current = 'critical'
       setWarningLevel('critical')
-      // Only interrupt if NOT currently answering
-      // If answering, warning will be spoken after the answer is submitted
       if (!isAnsweringRef.current && aiStateRef.current !== 'thinking') {
         speak("We're almost out of time. This will be our last question.").then(() => {
-          loadAndSpeakNextQuestion()
+          if (isMountedRef.current) loadAndSpeakNextQuestion()
         })
       }
     } else if (pct >= 0.80 && !warningSpokenRef.current.warning) {
@@ -309,6 +329,8 @@ export default function InterviewRun() {
 
   // ── Boot ──────────────────────────────────────────────────────────
   useEffect(() => {
+    isMountedRef.current = true   // ← mark as mounted
+
     const raw = sessionStorage.getItem('interviewSession')
     if (!raw) { navigate('/interview'); return }
     const sess = JSON.parse(raw)
@@ -321,15 +343,34 @@ export default function InterviewRun() {
       hasBootedRef.current = true
       const persona = sess.persona || 'your interviewer'
       await speak(`Hello! I'm your ${persona} today. Let's begin the interview.`)
+      if (!isMountedRef.current) return
       await loadAndSpeakNextQuestion()
     }
     boot()
 
     return () => {
+      // ── Mark unmounted FIRST — stops all async chains immediately ──
+      isMountedRef.current = false
+
+      // Stop timer
       clearInterval(timerRef.current)
+
+      // Stop silence detection loop
       cancelAnimationFrame(animFrameRef.current)
+
+      // Stop microphone and recording
       isRecordingRef.current = false
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        mediaRecorderRef.current.stop()
+      }
       streamRef.current?.getTracks().forEach(t => t.stop())
+
+      // ── Stop currently playing TTS audio immediately ───────────────
+      if (currentAudioRef.current) {
+        currentAudioRef.current.pause()
+        currentAudioRef.current.src = ''
+        currentAudioRef.current = null
+      }
     }
   }, [])
 
@@ -389,21 +430,21 @@ export default function InterviewRun() {
         <div className="timer-banner warning">Interview entering final stage — {fmt(remaining)} remaining.</div>
       )}
 
-      {/* VOICE STAGE — no question text on screen */}
+      {/* VOICE STAGE */}
       <div className="voice-stage">
         <div className="voice-center">
-              {/* Question text */}
-    {question && (
-      <div className="voice-question-text">
-        {question.question}
-      </div>
-    )}
+
+          {/* Question text */}
+          {question && (
+            <div className="voice-question-text">
+              {question.question}
+            </div>
+          )}
 
           <OrbIndicator state={aiState} />
 
           <div className={`voice-state-label ${aiState}`}>{stateLabel}</div>
 
-          {/* Live transcript */}
           {transcript && (
             <div className="voice-transcript">
               <div className="voice-transcript-label">Your answer</div>
