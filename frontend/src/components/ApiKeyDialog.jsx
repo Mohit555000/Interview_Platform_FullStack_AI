@@ -74,7 +74,7 @@ export default function ApiKeyDialog({ onConfirm, onSkip }) {
           <div>
             <div className="akd-title">Connect Your LLM</div>
             <div className="akd-subtitle">
-              Your key is used only for this session and never stored.
+              An API key is required to use this platform. It is never stored.
             </div>
           </div>
         </div>
@@ -141,11 +141,8 @@ export default function ApiKeyDialog({ onConfirm, onSkip }) {
 
         {/* ACTIONS */}
         <div className="akd-actions">
-          <button className="akd-skip" onClick={onSkip}>
-            Use platform default
-          </button>
           <button className="akd-confirm btn-primary" onClick={handleConfirm}>
-            Connect & Continue →
+            Connect & Start Interview →
           </button>
         </div>
 

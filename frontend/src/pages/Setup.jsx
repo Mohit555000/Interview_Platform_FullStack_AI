@@ -102,12 +102,6 @@ export default function Setup() {
     await beginSession(config)
   }
 
-  const handleApiKeySkip = async () => {
-    setShowApiDialog(false)
-    setLlmConfig(null)
-    await beginSession(null)
-  }
-
   const beginSession = async (config) => {
     setLoading(true)
     setLoadingStep(0)
@@ -137,7 +131,7 @@ export default function Setup() {
 
   return (
     <div className="setup-page">
-      {showApiDialog && <ApiKeyDialog onConfirm={handleApiKeyConfirm} onSkip={handleApiKeySkip} />}
+      {showApiDialog && <ApiKeyDialog onConfirm={handleApiKeyConfirm} />}
 
       <div className="setup-container">
         <div className="setup-header">
