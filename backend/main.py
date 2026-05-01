@@ -21,7 +21,7 @@ app = FastAPI(title="InterviewAI API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000","https://interview-platform-full-stack-ai-u3.vercel.app/"],
+    allow_origins=["http://localhost:5173", "http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -149,13 +149,6 @@ def health():
 
 
 # ── TTS: OpenAI gpt-4o-mini-tts with fable voice ─────────────────
-# ── Consistent voice persona — initialized once at module level ───
-_TTS_INSTRUCTIONS = (
-    "You are a calm, professional technical interviewer. "
-    "Speak in a clear, measured, neutral British accent. "
-    "Maintain the exact same tone, pace, and pitch for every sentence. "
-    "Do not vary your energy level between greetings and questions."
-)
 @app.post("/tts")
 async def text_to_speech(body: TTSRequest):
     """
@@ -170,7 +163,6 @@ async def text_to_speech(body: TTSRequest):
         voice="fable",
         input=body.text,
         response_format="mp3",
-        instructions=_TTS_INSTRUCTIONS,
     )
 
     audio_bytes = response.content
@@ -292,7 +284,9 @@ async def start_session(
             "current_question": "",
             "current_answer": "",
             "current_answer_cleaned": None,
+            "current_answer_enhanced": None,
             "interviewer_persona": None,
+            "translated_queries": None,
             "final_report": None,
             "overall_rating": None,
             "individual_ratings": None,
@@ -359,8 +353,10 @@ def submit_answer(session_id: str, body: AnswerRequest):
 
     state["current_answer"] = body.answer
     state["current_answer_cleaned"] = None
+    state["current_answer_enhanced"] = None
 
     state = engine.clean_response_node(state)
+    state = engine.enhance_answer_node(state)   # ← semantic normalization
     state = engine.evaluate_answer_node(state)
     state = engine.adaptation_node(state)
     state = engine.generate_question_node(state)

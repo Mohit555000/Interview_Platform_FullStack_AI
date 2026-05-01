@@ -89,8 +89,6 @@ class InterviewState(TypedDict):
     resume_text: str
     jd_text: str
     interview_mode: str
-    current_answer_cleaned: Optional[str] 
-    current_answer_enhanced:Optional[str];
 
     # Parsed data
     resume_data: Optional[Dict[str, Any]]
@@ -109,9 +107,14 @@ class InterviewState(TypedDict):
     # Current interaction
     current_question: str
     current_answer: str
+    current_answer_cleaned: Optional[str]   # after filler removal
+    current_answer_enhanced: Optional[str]  # after semantic normalization
 
     # ── V2: Dynamic interviewer persona ──────────────────────────
     interviewer_persona: Optional[str]
+
+    # ── V2: Query translation results (multi-query retrieval) ────
+    translated_queries: Optional[List[str]]
 
     # Final output
     final_report: Optional[str]
@@ -204,6 +207,7 @@ class QdrantManager:
         )
 
     def search_relevant_topics(self, query: str, session_id: str, limit: int = 3):
+        """Single vector search — kept for backwards compatibility"""
         query_vector = self.embeddings.embed_query(query)
         results = self.client.query_points(
             collection_name="jd_embeddings",
@@ -212,6 +216,59 @@ class QdrantManager:
             query_filter=Filter(must=[FieldCondition(key="session_id", match=MatchValue(value=session_id))])
         )
         return [r.payload.get("content") for r in results.points]
+
+    def multi_search_relevant_topics(
+        self,
+        queries: List[str],
+        session_id: str,
+        limit_per_query: int = 5,
+        final_limit: int = 3
+    ) -> List[str]:
+        """
+        Query Translation: Multi-Query Retrieval with Reciprocal Rank Fusion (RRF).
+
+        Instead of one search, runs N searches with different query variations
+        and merges the results using RRF reranking.
+
+        RRF formula: score(topic) = sum(1 / (rank + k)) across all queries
+        where k=60 is a smoothing constant.
+        Topics appearing highly ranked in multiple queries score highest.
+
+        Returns top `final_limit` topics after fusion.
+        """
+        # Collect ranked results from each query
+        rrf_scores: Dict[str, float] = {}
+        topic_content: Dict[str, str] = {}
+        K = 60  # RRF smoothing constant
+
+        for query in queries:
+            if not query.strip():
+                continue
+            try:
+                query_vector = self.embeddings.embed_query(query)
+                results = self.client.query_points(
+                    collection_name="jd_embeddings",
+                    query=query_vector,
+                    limit=limit_per_query,
+                    query_filter=Filter(must=[
+                        FieldCondition(key="session_id", match=MatchValue(value=session_id))
+                    ])
+                )
+                # Apply RRF scoring — rank 1 scores highest
+                for rank, point in enumerate(results.points, start=1):
+                    content = point.payload.get("content", "")
+                    if not content:
+                        continue
+                    topic_id = content.lower().strip()
+                    topic_content[topic_id] = content
+                    rrf_scores[topic_id] = rrf_scores.get(topic_id, 0) + (1.0 / (rank + K))
+            except Exception as e:
+                click.echo(f"⚠️ Multi-search query failed: {e}")
+                continue
+
+        # Sort by RRF score descending and return top results
+        sorted_topics = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+        return [topic_content[tid] for tid, _ in sorted_topics[:final_limit]]
 
 
 class Neo4jManager:
@@ -445,25 +502,23 @@ class InterviewEngine:
         workflow.add_node("parse_resume", self.parse_resume_node)
         workflow.add_node("parse_jd", self.parse_jd_node)
         workflow.add_node("plan_interview", self.plan_interview_node)
+        workflow.add_node("translate_query", self.translate_query_node)   # ← new
         workflow.add_node("generate_question", self.generate_question_node)
         workflow.add_node("get_answer", self.get_answer_node)
         workflow.add_node("evaluate_answer", self.evaluate_answer_node)
         workflow.add_node("adapt", self.adaptation_node)
         workflow.add_node("generate_feedback", self.generate_feedback_node)
-        workflow.add_node("clean_response", self.clean_response_node)
-        workflow.add_node("enhance_answer", self.enhance_answer_node)
         workflow.set_entry_point("parse_resume")
         workflow.add_edge("parse_resume", "parse_jd")
         workflow.add_edge("parse_jd", "plan_interview")
-        workflow.add_edge("plan_interview", "generate_question")
+        workflow.add_edge("plan_interview", "translate_query")            # ← new
+        workflow.add_edge("translate_query", "generate_question")         # ← new
         workflow.add_edge("generate_question", "get_answer")
-        workflow.add_edge("get_answer", "clean_response")
-        workflow.add_edge("clean_response", "enhance_answer")
-        workflow.add_edge("enhance_answer", "evaluate_answer")
+        workflow.add_edge("get_answer", "evaluate_answer")
         workflow.add_edge("evaluate_answer", "adapt")
         workflow.add_conditional_edges(
             "adapt", self.should_continue,
-            {"continue": "generate_question", "end": "generate_feedback"}
+            {"continue": "translate_query", "end": "generate_feedback"}  # ← loops back to translate
         )
         workflow.add_edge("generate_feedback", END)
         return workflow.compile()
@@ -498,18 +553,18 @@ class InterviewEngine:
         # Works for any role: Data Scientist, DevOps, PM, ML Engineer, etc.
         persona_prompt = ChatPromptTemplate.from_messages([
             ("system", """You are an expert at identifying job roles and seniority levels.
-Given a job description, return a short interviewer persona title (3–6 words).
-Examples:
-- 'Senior Data Scientist'
-- 'ML Engineering Lead'
-- 'DevOps Architect'
-- 'Product Manager'
-- 'Frontend Engineering Lead'
-- 'Backend Software Engineer'
-- 'Cloud Infrastructure Engineer'
-- 'AI Research Scientist'
+        Given a job description, return a short interviewer persona title (3–6 words).
+        Examples:
+        - 'Senior Data Scientist'
+        - 'ML Engineering Lead'
+        - 'DevOps Architect'
+        - 'Product Manager'
+        - 'Frontend Engineering Lead'
+        - 'Backend Software Engineer'
+        - 'Cloud Infrastructure Engineer'
+        - 'AI Research Scientist'
 
-Return ONLY the title. No explanation, no punctuation, no extra words."""),
+        Return ONLY the title. No explanation, no punctuation, no extra words."""),
             ("user", f"Job Description:\n{state['jd_text'][:800]}\n\nInterviewer persona title:")
         ])
         persona_chain = persona_prompt | self.llm | StrOutputParser()
@@ -526,6 +581,108 @@ Return ONLY the title. No explanation, no punctuation, no extra words."""),
 
         return state
 
+    def translate_query_node(self, state: InterviewState) -> InterviewState:
+        """
+        Node: Query Translation/Enhancement Layer (Retrieval Side)
+
+        Sits before generate_question_node.
+
+        Simple explanation:
+        We want to find JD topics not yet covered. Instead of one search,
+        we generate 3 different search queries from different angles:
+
+        1. Direct gap query — what topics from JD haven't been asked yet?
+        2. Prerequisite query — what foundational skills relate to what's been asked?
+        3. Advanced query — what deeper topics build on the candidate's strong answers?
+
+        Then we run all 3 searches in parallel and merge using RRF reranking.
+        Topics that appear highly in multiple searches bubble to the top.
+
+        Also applies sub-query decomposition — if covered topics are complex
+        (e.g. "React performance optimization"), breaks into atomic sub-queries
+        (e.g. "React memo", "useMemo", "re-render prevention") for better recall.
+        """
+        covered_topics  = [qa["question"] for qa in state["qa_history"]]
+        strong_topics   = [qa["question"] for qa in state["qa_history"] if qa["overall_score"] >= 3.5]
+        weak_topics     = [qa["question"] for qa in state["qa_history"] if qa["overall_score"] < 3.0]
+        jd_skills       = state["jd_requirements"]["required_skills"]
+        resume_skills   = state["resume_data"]["skills"]
+        experience      = state["resume_data"]["experience_years"]
+
+        # ── If no history yet, return simple starter queries ─────────
+        if not covered_topics:
+            state["translated_queries"] = [
+                " ".join(jd_skills[:3]),
+                state["jd_requirements"]["summary"],
+                state["jd_requirements"]["experience_level"] + " " + " ".join(jd_skills[:2])
+            ]
+            return state
+
+        # ── Use LLM to generate 3 query variations ───────────────────
+        translation_prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are an expert technical interview query translator.
+
+        Given the interview context, generate exactly 3 different search queries
+        to find the most relevant JD topics not yet covered.
+
+        Each query should approach the topic gap from a DIFFERENT angle:
+        Query 1 (Gap-based): Focus on JD required skills not yet asked about
+        Query 2 (Prerequisite-based): Focus on foundational concepts that support already-covered topics
+        Query 3 (Progression-based): Focus on advanced topics that build on the candidate's strong answers
+
+        Rules:
+        - Each query must be 3-8 words max
+        - Each query must be meaningfully different from the others
+        - Use technical terminology from the JD and resume
+        - Return ONLY a JSON array of 3 strings: ["query1", "query2", "query3"]"""),
+                ("user", f"""JD Required Skills: {', '.join(jd_skills)}
+        Candidate Skills: {', '.join(resume_skills[:8])}
+        Experience: {experience} years
+        Already covered topics: {', '.join(covered_topics[-5:]) if covered_topics else 'None'}
+        Strong areas (score >= 3.5): {', '.join(strong_topics[-3:]) if strong_topics else 'None'}
+        Weak areas (score < 3.0): {', '.join(weak_topics[-3:]) if weak_topics else 'None'}
+
+        Generate 3 search queries to find uncovered relevant topics:""")
+            ])
+
+        try:
+            translation_chain = translation_prompt | self.llm | JsonOutputParser()
+            queries = translation_chain.invoke({})
+
+            # Validate — must be a list of 3 non-empty strings
+            if not isinstance(queries, list) or len(queries) < 1:
+                raise ValueError("Invalid query format from LLM")
+
+            queries = [q.strip() for q in queries if isinstance(q, str) and q.strip()]
+
+            # ── Sub-query decomposition for complex queries ───────────
+            # If any query is long/complex, add atomic sub-queries
+            decomposed = []
+            for q in queries:
+                decomposed.append(q)
+                if len(q.split()) > 5:
+                    # Break into smaller atomic queries
+                    words = q.split()
+                    decomposed.append(" ".join(words[:3]))
+                    decomposed.append(" ".join(words[3:]))
+
+            # Always add a direct JD skills query as safety fallback
+            decomposed.append(" ".join(jd_skills[:4]))
+
+            state["translated_queries"] = decomposed
+            click.echo(f"✓ Query translation: {len(decomposed)} search queries generated")
+
+        except Exception as e:
+            click.echo(f"⚠️ Query translation failed, using fallback: {e}")
+            # Fallback to simple queries
+            state["translated_queries"] = [
+                " ".join(covered_topics[-2:]) if covered_topics else "general interview",
+                " ".join(jd_skills[:3]),
+                state["jd_requirements"]["summary"][:50]
+            ]
+
+        return state
+
     def generate_question_node(self, state: InterviewState) -> InterviewState:
         """Node: Generate next question using dynamic persona"""
         mode_config = Config.INTERVIEW_MODES[state["interview_mode"]]
@@ -539,12 +696,24 @@ Return ONLY the title. No explanation, no punctuation, no extra words."""),
             for i, qa in enumerate(state["qa_history"][-3:])
         ])
 
-        # Search relevant JD topics not yet covered
-        covered_topics = [qa["question"] for qa in state["qa_history"]]
-        relevant_topics = self.qdrant.search_relevant_topics(
-            " ".join(covered_topics) if covered_topics else "general interview",
-            state["session_id"]
-        )
+        # ── Use translated queries for multi-search retrieval ────────
+        # Falls back to simple search if translated_queries not available
+        translated_queries = state.get("translated_queries", [])
+        if translated_queries:
+            relevant_topics = self.qdrant.multi_search_relevant_topics(
+                queries=translated_queries,
+                session_id=state["session_id"],
+                limit_per_query=5,
+                final_limit=3
+            )
+            click.echo(f"✓ Retrieved {len(relevant_topics)} topics via multi-query RRF")
+        else:
+            # Fallback to single search
+            covered_topics = [qa["question"] for qa in state["qa_history"]]
+            relevant_topics = self.qdrant.search_relevant_topics(
+                " ".join(covered_topics) if covered_topics else "general interview",
+                state["session_id"]
+            )
 
         # Check if last answer was weak — generate easier follow-up
         is_follow_up = False
@@ -554,25 +723,25 @@ Return ONLY the title. No explanation, no punctuation, no extra words."""),
         prompt = ChatPromptTemplate.from_messages([
             ("system", f"""You are a {persona} conducting a technical interview.
 
-Candidate Profile:
-- Skills: {', '.join(state['resume_data']['skills'])}
-- Experience: {state['resume_data']['experience_years']} years
-- Summary: {state['resume_data']['summary']}
+        Candidate Profile:
+        - Skills: {', '.join(state['resume_data']['skills'])}
+        - Experience: {state['resume_data']['experience_years']} years
+        - Summary: {state['resume_data']['summary']}
 
-Job Requirements:
-- Required Skills: {', '.join(state['jd_requirements']['required_skills'])}
-- Level: {state['jd_requirements']['experience_level']}
-- Role Summary: {state['jd_requirements']['summary']}
+        Job Requirements:
+        - Required Skills: {', '.join(state['jd_requirements']['required_skills'])}
+        - Level: {state['jd_requirements']['experience_level']}
+        - Role Summary: {state['jd_requirements']['summary']}
 
-Interview Progress: Question {state['current_question_num'] + 1}/{state['max_questions']}
-Previous Q&As:
-{context if context else 'None yet'}
+        Interview Progress: Question {state['current_question_num'] + 1}/{state['max_questions']}
+        Previous Q&As:
+        {context if context else 'None yet'}
 
-{'IMPORTANT: The candidate struggled with the last question. Ask an EASIER follow-up on the same topic.' if is_follow_up else 'Ask a balanced question covering: ' + ', '.join(relevant_topics[:2]) if relevant_topics else 'Ask a relevant question based on the job requirements.'}
+        {'IMPORTANT: The candidate struggled with the last question. Ask an EASIER follow-up on the same topic.' if is_follow_up else 'Ask a balanced question covering: ' + ', '.join(relevant_topics[:2]) if relevant_topics else 'Ask a relevant question based on the job requirements.'}
 
-Generate ONE focused question relevant to this specific role. Be direct and clear. No preamble."""),
-            ("user", "Generate the next interview question.")
-        ])
+        Generate ONE focused question relevant to this specific role. Be direct and clear. No preamble."""),
+                ("user", "Generate the next interview question.")
+            ])
 
         chain = prompt | self.llm | StrOutputParser()
         question = chain.invoke({}).strip()
@@ -607,78 +776,110 @@ Generate ONE focused question relevant to this specific role. Be direct and clea
         answer_lower = answer.strip().lower()
         return any(phrase in answer_lower for phrase in dont_know_phrases)
 
-    def clean_response_node(self, state: InterviewState) -> InterviewState:
-        """V2: Query Optimization — cleans filler words before evaluation."""
-        original = state["current_answer"].strip()
-
-        # Skip for short answers or don't-know responses
-        if self._is_dont_know_response(original) or len(original.split()) < 10:
-            state["current_answer_cleaned"] = original
-            return state
-
-        clean_prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are a technical interview response optimizer.
-            Clean the candidate's answer by:
-            1. Removing filler words: um, uh, like, you know, basically, literally, kind of, sort of
-            2. Fixing obvious speech-to-text errors and typos
-            3. Completing clearly incomplete sentences
-            4. Preserving ALL technical content and meaning exactly
-            5. Do NOT add new information or correct technical mistakes
-
-            Return ONLY the cleaned answer text. No explanation."""),
-            ("user", "Original answer:\n{answer}\n\nCleaned answer:")
-        ])
-
-        try:
-            clean_chain = clean_prompt | self.llm | StrOutputParser()
-            cleaned = clean_chain.invoke({"answer": original}).strip()
-            if not cleaned or len(cleaned) < len(original) * 0.3:
-                cleaned = original
-            state["current_answer_cleaned"] = cleaned
-        except Exception:
-            state["current_answer_cleaned"] = original
-
-        return state
     def enhance_answer_node(self, state: InterviewState) -> InterviewState:
         """
-        Normalize and expand user answer for semantic evaluation.
-        - Corrects STT terminology errors using question context
-        - Maps equivalent concepts (e.g. 'event loop' ↔ 'async processing')
-        - Expands implicit knowledge into explicit statements
-        - Does NOT add information the user didn't convey
+        Node: Semantic Answer Normalization (Answer Enhancement Layer)
+
+        Sits between clean_response_node and evaluate_answer_node.
+
+        Simple explanation:
+        - Takes the cleaned answer + the question that was asked
+        - Fixes STT terminology errors using the question as context
+          e.g. "avent loop" → "event loop"
+        - Maps informal descriptions to proper technical terms
+          e.g. "that async thingy" → "event loop / async execution"
+        - Makes implied correct knowledge explicit
+          e.g. user describes how closures work → adds the term "closure"
+        - NEVER adds knowledge the user didn't have
+          if they missed something, it stays missing
+
+        Result: evaluator judges understanding, not vocabulary or pronunciation.
+        Original answer is always preserved in current_answer for display.
         """
-        answer  = state.get("current_answer_cleaned") or state["current_answer"]
+        original = state.get("current_answer_cleaned") or state["current_answer"]
+
+        # Skip for don't-know responses — nothing to enhance
+        if self._is_dont_know_response(original):
+            state["current_answer_enhanced"] = original
+            return state
+
+        # Skip very short answers — not enough content to enhance
+        if len(original.split()) < 8:
+            state["current_answer_enhanced"] = original
+            return state
+
         question = state["current_question"]
+        role     = state.get("interviewer_persona", "Technical Interviewer")
 
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are a technical interview answer normalizer.
+        enhance_prompt = ChatPromptTemplate.from_messages([
+            ("system", f"""You are a semantic answer normalizer for a {role} technical interview.
 
-        Given a question and a candidate's spoken answer, produce an enhanced version that:
-        1. Corrects likely speech-to-text errors using the question as context
-        (e.g. "a vent loop" → "event loop", "use state" → "useState")
-        2. Maps informal or equivalent terminology to standard technical terms
-        (e.g. "that thing where functions remember stuff" → "closures/lexical scoping")
-        3. Makes implicit correct knowledge explicit
-        (e.g. if they describe how promises work without saying "promise" — add the term)
-        4. Preserves the candidate's actual knowledge level — do NOT add concepts they didn't mention
-        5. Preserves their gaps — if they missed something, keep it missing
-    
-        Return ONLY the enhanced answer. No explanation."""),
-            ("user", f"Question: {question}\n\nCandidate's answer: {answer}\n\nEnhanced answer:")
-        ])
-    
+        Your job is to produce an enhanced version of the candidate's spoken answer that:
+
+        1. CORRECT STT ERRORS using the question as context
+        - Use the question to infer what technical terms the candidate likely said
+        - Example: question asks about "event loop" → "avent loop" → "event loop"
+        - Example: "use state hook" → "useState hook"
+
+        2. MAP INFORMAL TERMS to standard technical vocabulary
+        - "that async thingy where it doesn't get stuck" → "non-blocking async execution / event loop"
+        - "the thing that remembers variables" → "closure / lexical scoping"
+        - "when you split your app into pieces" → "component-based architecture / modularization"
+
+        3. MAKE IMPLIED KNOWLEDGE EXPLICIT
+        - If the candidate correctly describes a concept without naming it, add the name
+        - If they explain HOW something works correctly, make sure the WHAT is stated
+
+        4. STRICT RULES — do NOT violate these  :
+        - Do NOT add concepts the candidate did not mention or imply
+        - Do NOT fix incorrect technical statements — keep their mistakes
+        - Do NOT increase the apparent depth of their answer beyond what they said
+        - Do NOT change the structure or flow significantly
+        - If the answer is already clear and technical, return it as-is
+
+        Return ONLY the enhanced answer text. No explanation, no preamble."""),
+                ("user", f"Question asked: {question}\n\nCandidate's answer: {original}\n\nEnhanced answer:")
+            ])
+
         try:
-            chain = prompt | self.llm | StrOutputParser()
-            enhanced = chain.invoke({}).strip()
-            if not enhanced or len(enhanced) < len(answer) * 0.3:
-                enhanced = answer
+            enhance_chain = enhance_prompt | self.llm | StrOutputParser()
+            enhanced = enhance_chain.invoke({}).strip()
+
+            # Safety checks — fall back to original if enhancement looks wrong
+            if not enhanced:
+                enhanced = original
+            elif len(enhanced) > len(original) * 2.5:
+                # Enhanced is more than 2.5x longer — likely hallucinating content
+                enhanced = original
+            elif len(enhanced) < len(original) * 0.3:
+                # Enhanced is too short — something went wrong
+                enhanced = original
+
             state["current_answer_enhanced"] = enhanced
-        except Exception:
-            state["current_answer_enhanced"] = answer
+            click.echo("✓ Answer semantically normalized")
+
+        except Exception as e:
+            click.echo(f"⚠️ Enhancement skipped: {e}")
+            state["current_answer_enhanced"] = original
 
         return state
+
+    def _is_dont_know_response(self, answer: str) -> bool:
+        """Detect if the user is admitting they don't know the answer"""
+        dont_know_phrases = [
+            "i don't know", "i do not know", "i dont know",
+            "i have no idea", "no idea", "not sure", "i'm not sure",
+            "i am not sure", "i didn't understand", "i did not understand",
+            "i don't understand", "i do not understand", "i cant answer",
+            "i can't answer", "i cannot answer", "no clue", "beats me",
+            "not familiar", "i'm unfamiliar", "never heard", "no knowledge",
+            "i skip", "skip", "pass", "i pass"
+        ]
+        answer_lower = answer.strip().lower()
+        return any(phrase in answer_lower for phrase in dont_know_phrases)
+
     def evaluate_answer_node(self, state: InterviewState) -> InterviewState:
-        """Node: Evaluate answer quality"""
+        """Node: Evaluate answer — uses enhanced answer for scoring, original for display"""
         click.echo("\n⏳ Evaluating your answer...")
 
         if self._is_dont_know_response(state["current_answer"]):
@@ -686,7 +887,7 @@ Generate ONE focused question relevant to this specific role. Be direct and clea
             qa_record = {
                 "question_id": state["current_question_num"],
                 "question": state["current_question"],
-                "answer": state["current_answer"],
+                "answer": state["current_answer"],   # always show original
                 "technical_score": 1.0,
                 "clarity_score": 1.0,
                 "confidence_score": 1.0,
@@ -702,12 +903,16 @@ Generate ONE focused question relevant to this specific role. Be direct and clea
             self.neo4j.store_qa_evaluation(state["session_id"], qa_record)
             click.echo("✓ Score: 1.0/5.0")
             return state
+
+        # ── Use enhanced answer for evaluation (better semantic matching) ──
+        # Falls back: enhanced → cleaned → raw original
         eval_answer = (
             state.get("current_answer_enhanced")
             or state.get("current_answer_cleaned")
             or state["current_answer"]
         )
-        # Check for off-topic
+
+        # Off-topic check using enhanced answer
         off_topic_prompt = ChatPromptTemplate.from_messages([
             ("system", """Determine if the answer addresses the question.
 Return ONLY a JSON with: {{"is_off_topic": true/false, "reason": "brief explanation"}}"""),
@@ -716,13 +921,13 @@ Return ONLY a JSON with: {{"is_off_topic": true/false, "reason": "brief explanat
         off_topic_chain = off_topic_prompt | self.llm | JsonOutputParser()
         off_topic_result = off_topic_chain.invoke({
             "question": state["current_question"],
-            "answer": eval_answer
+            "answer": eval_answer    # ← enhanced
         })
 
         if off_topic_result.get("is_off_topic"):
             click.echo(f"\n⚠️  Off-topic detected: {off_topic_result['reason']} (continuing anyway)")
 
-        # Evaluate answer
+        # Evaluate using enhanced answer
         eval_prompt = ChatPromptTemplate.from_messages([
             ("system", """Evaluate this interview answer on a scale of 1-5:
 
@@ -745,13 +950,13 @@ Return ONLY a JSON:
         eval_chain = eval_prompt | self.llm | JsonOutputParser()
         evaluation = eval_chain.invoke({
             "question": state["current_question"],
-            "answer": eval_answer
+            "answer": eval_answer    # ← enhanced
         })
 
         qa_record = {
             "question_id": state["current_question_num"],
             "question": state["current_question"],
-            "answer": state["current_answer"],
+            "answer": state["current_answer"],   # ← always original for display
             "technical_score": evaluation["technical_score"],
             "clarity_score": evaluation["clarity_score"],
             "confidence_score": evaluation["confidence_score"],
@@ -809,30 +1014,30 @@ Return ONLY a JSON:
         feedback_prompt = ChatPromptTemplate.from_messages([
             ("system", f"""You are an interview coach providing detailed feedback for a {persona} interview.
 
-Create a comprehensive feedback report with:
-1. Overall performance summary
-2. Strengths (specific examples from their answers)
-3. Areas for improvement (detailed, actionable)
-4. Specific study recommendations relevant to this role
-5. Interview readiness assessment
+        Create a comprehensive feedback report with:
+        1. Overall performance summary
+        2. Strengths (specific examples from their answers)
+        3. Areas for improvement (detailed, actionable)
+        4. Specific study recommendations relevant to this role
+        5. Interview readiness assessment
 
-Be encouraging but honest. Provide actionable next steps tailored to the {persona} role."""),
+        Be encouraging but honest. Provide actionable next steps tailored to the {persona} role."""),
             ("user", f"""Interview Results:
 
-Performance Metrics:
-- Technical Accuracy: {avg_technical}/5
-- Clarity: {avg_clarity}/5
-- Confidence: {avg_confidence}/5
-- Overall: {avg_overall}/5
+        Performance Metrics:
+        - Technical Accuracy: {avg_technical}/5
+        - Clarity: {avg_clarity}/5
+        - Confidence: {avg_confidence}/5
+        - Overall: {avg_overall}/5
 
-Q&A History:
-{qa_summary}
+        Q&A History:
+        {qa_summary}
 
-Identified Weaknesses:
-{weakness_summary}
+        Identified Weaknesses:
+        {weakness_summary}
 
-Generate detailed feedback report.""")
-        ])
+        Generate detailed feedback report.""")
+            ])
 
         feedback_chain = feedback_prompt | self.llm | StrOutputParser()
         detailed_feedback = feedback_chain.invoke({})
