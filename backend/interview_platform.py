@@ -640,43 +640,43 @@ Generate ONE focused question relevant to this specific role. Be direct and clea
 
         return state
     def enhance_answer_node(self, state: InterviewState) -> InterviewState:
-    """
-    Normalize and expand user answer for semantic evaluation.
-    - Corrects STT terminology errors using question context
-    - Maps equivalent concepts (e.g. 'event loop' ↔ 'async processing')
-    - Expands implicit knowledge into explicit statements
-    - Does NOT add information the user didn't convey
-    """
-    answer  = state.get("current_answer_cleaned") or state["current_answer"]
-    question = state["current_question"]
+        """
+        Normalize and expand user answer for semantic evaluation.
+        - Corrects STT terminology errors using question context
+        - Maps equivalent concepts (e.g. 'event loop' ↔ 'async processing')
+        - Expands implicit knowledge into explicit statements
+        - Does NOT add information the user didn't convey
+        """
+        answer  = state.get("current_answer_cleaned") or state["current_answer"]
+        question = state["current_question"]
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", """You are a technical interview answer normalizer.
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are a technical interview answer normalizer.
 
-    Given a question and a candidate's spoken answer, produce an enhanced version that:
-    1. Corrects likely speech-to-text errors using the question as context
-    (e.g. "a vent loop" → "event loop", "use state" → "useState")
-    2. Maps informal or equivalent terminology to standard technical terms
-    (e.g. "that thing where functions remember stuff" → "closures/lexical scoping")
-    3. Makes implicit correct knowledge explicit
-    (e.g. if they describe how promises work without saying "promise" — add the term)
-    4. Preserves the candidate's actual knowledge level — do NOT add concepts they didn't mention
-    5. Preserves their gaps — if they missed something, keep it missing
+        Given a question and a candidate's spoken answer, produce an enhanced version that:
+        1. Corrects likely speech-to-text errors using the question as context
+        (e.g. "a vent loop" → "event loop", "use state" → "useState")
+        2. Maps informal or equivalent terminology to standard technical terms
+        (e.g. "that thing where functions remember stuff" → "closures/lexical scoping")
+        3. Makes implicit correct knowledge explicit
+        (e.g. if they describe how promises work without saying "promise" — add the term)
+        4. Preserves the candidate's actual knowledge level — do NOT add concepts they didn't mention
+        5. Preserves their gaps — if they missed something, keep it missing
+    
+        Return ONLY the enhanced answer. No explanation."""),
+            ("user", f"Question: {question}\n\nCandidate's answer: {answer}\n\nEnhanced answer:")
+        ])
+    
+        try:
+            chain = prompt | self.llm | StrOutputParser()
+            enhanced = chain.invoke({}).strip()
+            if not enhanced or len(enhanced) < len(answer) * 0.3:
+                enhanced = answer
+            state["current_answer_enhanced"] = enhanced
+        except Exception:
+            state["current_answer_enhanced"] = answer
 
-    Return ONLY the enhanced answer. No explanation."""),
-        ("user", f"Question: {question}\n\nCandidate's answer: {answer}\n\nEnhanced answer:")
-    ])
-
-    try:
-        chain = prompt | self.llm | StrOutputParser()
-        enhanced = chain.invoke({}).strip()
-        if not enhanced or len(enhanced) < len(answer) * 0.3:
-            enhanced = answer
-        state["current_answer_enhanced"] = enhanced
-    except Exception:
-        state["current_answer_enhanced"] = answer
-
-    return state
+        return state
     def evaluate_answer_node(self, state: InterviewState) -> InterviewState:
         """Node: Evaluate answer quality"""
         click.echo("\n⏳ Evaluating your answer...")
