@@ -89,6 +89,8 @@ class InterviewState(TypedDict):
     resume_text: str
     jd_text: str
     interview_mode: str
+    current_answer_cleaned: Optional[str] 
+    current_answer_enhanced:Optional[str];
 
     # Parsed data
     resume_data: Optional[Dict[str, Any]]
@@ -448,12 +450,16 @@ class InterviewEngine:
         workflow.add_node("evaluate_answer", self.evaluate_answer_node)
         workflow.add_node("adapt", self.adaptation_node)
         workflow.add_node("generate_feedback", self.generate_feedback_node)
+        workflow.add_node("clean_response", self.clean_response_node)
+        workflow.add_node("enhance_answer", self.enhance_answer_node)
         workflow.set_entry_point("parse_resume")
         workflow.add_edge("parse_resume", "parse_jd")
         workflow.add_edge("parse_jd", "plan_interview")
         workflow.add_edge("plan_interview", "generate_question")
         workflow.add_edge("generate_question", "get_answer")
-        workflow.add_edge("get_answer", "evaluate_answer")
+        workflow.add_edge("get_answer", "clean_response")
+        workflow.add_edge("clean_response", "enhance_answer")
+        workflow.add_edge("enhance_answer", "evaluate_answer")
         workflow.add_edge("evaluate_answer", "adapt")
         workflow.add_conditional_edges(
             "adapt", self.should_continue,
@@ -633,6 +639,44 @@ Generate ONE focused question relevant to this specific role. Be direct and clea
             state["current_answer_cleaned"] = original
 
         return state
+    def enhance_answer_node(self, state: InterviewState) -> InterviewState:
+    """
+    Normalize and expand user answer for semantic evaluation.
+    - Corrects STT terminology errors using question context
+    - Maps equivalent concepts (e.g. 'event loop' ↔ 'async processing')
+    - Expands implicit knowledge into explicit statements
+    - Does NOT add information the user didn't convey
+    """
+    answer  = state.get("current_answer_cleaned") or state["current_answer"]
+    question = state["current_question"]
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are a technical interview answer normalizer.
+
+    Given a question and a candidate's spoken answer, produce an enhanced version that:
+    1. Corrects likely speech-to-text errors using the question as context
+    (e.g. "a vent loop" → "event loop", "use state" → "useState")
+    2. Maps informal or equivalent terminology to standard technical terms
+    (e.g. "that thing where functions remember stuff" → "closures/lexical scoping")
+    3. Makes implicit correct knowledge explicit
+    (e.g. if they describe how promises work without saying "promise" — add the term)
+    4. Preserves the candidate's actual knowledge level — do NOT add concepts they didn't mention
+    5. Preserves their gaps — if they missed something, keep it missing
+
+    Return ONLY the enhanced answer. No explanation."""),
+        ("user", f"Question: {question}\n\nCandidate's answer: {answer}\n\nEnhanced answer:")
+    ])
+
+    try:
+        chain = prompt | self.llm | StrOutputParser()
+        enhanced = chain.invoke({}).strip()
+        if not enhanced or len(enhanced) < len(answer) * 0.3:
+            enhanced = answer
+        state["current_answer_enhanced"] = enhanced
+    except Exception:
+        state["current_answer_enhanced"] = answer
+
+    return state
     def evaluate_answer_node(self, state: InterviewState) -> InterviewState:
         """Node: Evaluate answer quality"""
         click.echo("\n⏳ Evaluating your answer...")
@@ -658,7 +702,11 @@ Generate ONE focused question relevant to this specific role. Be direct and clea
             self.neo4j.store_qa_evaluation(state["session_id"], qa_record)
             click.echo("✓ Score: 1.0/5.0")
             return state
-
+        eval_answer = (
+            state.get("current_answer_enhanced")
+            or state.get("current_answer_cleaned")
+            or state["current_answer"]
+        )
         # Check for off-topic
         off_topic_prompt = ChatPromptTemplate.from_messages([
             ("system", """Determine if the answer addresses the question.
@@ -668,7 +716,7 @@ Return ONLY a JSON with: {{"is_off_topic": true/false, "reason": "brief explanat
         off_topic_chain = off_topic_prompt | self.llm | JsonOutputParser()
         off_topic_result = off_topic_chain.invoke({
             "question": state["current_question"],
-            "answer": state["current_answer"]
+            "answer": eval_answer
         })
 
         if off_topic_result.get("is_off_topic"):
@@ -697,7 +745,7 @@ Return ONLY a JSON:
         eval_chain = eval_prompt | self.llm | JsonOutputParser()
         evaluation = eval_chain.invoke({
             "question": state["current_question"],
-            "answer": state["current_answer"]
+            "answer": eval_answer
         })
 
         qa_record = {
