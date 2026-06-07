@@ -115,30 +115,13 @@ class TTSRequest(BaseModel):
 
 def _delete_session_data(engine: InterviewEngine, session_id: str):
     try:
-        driver = engine.neo4j._new_driver()
-        with driver.session() as neo_session:
-            neo_session.run("""
-                MATCH (u:User {session_id: $session_id})
-                OPTIONAL MATCH (u)-[:ASKED]->(q:Question)-[:ANSWERED_BY]->(a:Answer)
-                OPTIONAL MATCH (a)-[:REVEALS]->(w:Weakness)-[:SUGGESTS]->(i:Improvement)
-                OPTIONAL MATCH (u)-[:TARGETS]->(r:Requirement)
-                DETACH DELETE u, q, a, w, i, r
-            """, session_id=session_id)
-            neo_session.run("MATCH (s:Skill) WHERE NOT (s)--() DELETE s")
-        driver.close()
+        engine.neo4j.delete_session_data(session_id)
     except Exception as e:
-        print(f"[cleanup] Neo4j warning: {e}")
+        print(f"[cleanup] Kuzu warning: {e}")
     try:
-        from qdrant_client.models import Filter, FieldCondition, MatchValue
-        f = Filter(must=[FieldCondition(key="session_id", match=MatchValue(value=session_id))])
-        for col in ["resume_embeddings", "jd_embeddings", "qa_context"]:
-            try:
-                engine.qdrant.client.delete(collection_name=col, points_selector=f)
-            except Exception as e:
-                print(f"[cleanup] Qdrant warning ({col}): {e}")
-        print(f"[cleanup] Qdrant cleared for {session_id}")
+        engine.qdrant.delete_session_data(session_id)
     except Exception as e:
-        print(f"[cleanup] Qdrant warning: {e}")
+        print(f"[cleanup] Pinecone warning: {e}")
 
 
 # ── ENDPOINTS ─────────────────────────────────────────────────────

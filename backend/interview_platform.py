@@ -9,14 +9,12 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 from langgraph.graph import StateGraph, END
-from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
-from neo4j import GraphDatabase
 import numpy as np
 from datetime import datetime
-from qdrant_client.models import Filter, FieldCondition, MatchValue
 from dotenv import load_dotenv
 import uuid
+from pinecone_manager import PineconeManager
+from kuzu_manager import KuzuManager
 load_dotenv()
 
 # ===================================================================
@@ -25,15 +23,7 @@ load_dotenv()
 
 class Config:
     """Global configuration"""
-    #OpenAi Configurations
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "your-api-key-here")
-    #Qdrant Configurations
-    QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
-    QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-    #NEO4j Configurations
-    NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-    NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
-    NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
 
     # ── V2: Removed hardcoded personas from INTERVIEW_MODES ──────
     # Persona is now generated dynamically from the JD in plan_interview_node
@@ -122,310 +112,8 @@ class InterviewState(TypedDict):
     individual_ratings: Optional[Dict[str, float]]
 
 # ===================================================================
-# DATABASE MANAGERS
+# DATABASE MANAGERS  (PineconeManager / KuzuManager — imported above)
 # ===================================================================
-
-class QdrantManager:
-    """Manages Qdrant vector database operations"""
-
-    def __init__(self, openai_api_key: str = None):
-        self.client = QdrantClient(
-            url=Config.QDRANT_HOST,
-            api_key=Config.QDRANT_API_KEY,
-            timeout=60
-        )
-        self.embeddings = OpenAIEmbeddings(
-            model=Config.EMBEDDING_MODEL,
-            openai_api_key=openai_api_key or Config.OPENAI_API_KEY
-        )
-        self._setup_collections()
-
-    def _setup_collections(self):
-        """Create collections if they don't exist"""
-        collections = ["resume_embeddings", "jd_embeddings", "qa_context"]
-        for collection in collections:
-            if not self.client.collection_exists(collection):
-                self.client.create_collection(
-                    collection_name=collection,
-                    vectors_config=VectorParams(
-                        size=Config.EMBEDDING_DIMENSION,
-                        distance=Distance.COSINE
-                    )
-                )
-            self.client.create_payload_index(
-                collection_name=collection,
-                field_name="session_id",
-                field_schema="keyword"
-            )
-
-    def _batch_upsert(self, collection_name, points, batch_size=50):
-        """Upsert points in batches to avoid timeout"""
-        for i in range(0, len(points), batch_size):
-            batch = points[i:i + batch_size]
-            self.client.upsert(collection_name=collection_name, points=batch)
-
-    def store_resume_data(self, session_id: str, resume_data: Dict[str, Any]):
-        """Store resume embeddings"""
-        points = []
-        for skill in resume_data.get("skills", []):
-            vector = self.embeddings.embed_query(skill)
-            points.append(PointStruct(
-                id=str(uuid.uuid4()), vector=vector,
-                payload={"session_id": session_id, "type": "skill", "content": skill}
-            ))
-        for project in resume_data.get("projects", []):
-            vector = self.embeddings.embed_query(project)
-            points.append(PointStruct(
-                id=str(uuid.uuid4()), vector=vector,
-                payload={"session_id": session_id, "type": "project", "content": project}
-            ))
-        if points:
-            self._batch_upsert("resume_embeddings", points)
-
-    def store_jd_requirements(self, session_id: str, jd_requirements: Dict[str, Any]):
-        """Store JD embeddings"""
-        points = []
-        for skill in jd_requirements.get("required_skills", []):
-            vector = self.embeddings.embed_query(skill)
-            points.append(PointStruct(
-                id=str(uuid.uuid4()), vector=vector,
-                payload={"session_id": session_id, "type": "requirement", "content": skill, "priority": "high"}
-            ))
-        if points:
-            self._batch_upsert("jd_embeddings", points)
-
-    def store_qa(self, session_id: str, qa_id: int, question: str, answer: str, score: float):
-        """Store Q&A for context"""
-        context = f"Q: {question}\nA: {answer}"
-        vector = self.embeddings.embed_query(context)
-        self.client.upsert(
-            collection_name="qa_context",
-            points=[PointStruct(
-                id=str(uuid.uuid4()), vector=vector,
-                payload={"session_id": session_id, "question": question, "answer": answer, "score": score}
-            )]
-        )
-
-    def search_relevant_topics(self, query: str, session_id: str, limit: int = 3):
-        """Single vector search — kept for backwards compatibility"""
-        query_vector = self.embeddings.embed_query(query)
-        results = self.client.query_points(
-            collection_name="jd_embeddings",
-            query=query_vector,
-            limit=limit,
-            query_filter=Filter(must=[FieldCondition(key="session_id", match=MatchValue(value=session_id))])
-        )
-        return [r.payload.get("content") for r in results.points]
-
-    def multi_search_relevant_topics(
-        self,
-        queries: List[str],
-        session_id: str,
-        limit_per_query: int = 5,
-        final_limit: int = 3
-    ) -> List[str]:
-        """
-        Query Translation: Multi-Query Retrieval with Reciprocal Rank Fusion (RRF).
-
-        Instead of one search, runs N searches with different query variations
-        and merges the results using RRF reranking.
-
-        RRF formula: score(topic) = sum(1 / (rank + k)) across all queries
-        where k=60 is a smoothing constant.
-        Topics appearing highly ranked in multiple queries score highest.
-
-        Returns top `final_limit` topics after fusion.
-        """
-        # Collect ranked results from each query
-        rrf_scores: Dict[str, float] = {}
-        topic_content: Dict[str, str] = {}
-        K = 60  # RRF smoothing constant
-
-        for query in queries:
-            if not query.strip():
-                continue
-            try:
-                query_vector = self.embeddings.embed_query(query)
-                results = self.client.query_points(
-                    collection_name="jd_embeddings",
-                    query=query_vector,
-                    limit=limit_per_query,
-                    query_filter=Filter(must=[
-                        FieldCondition(key="session_id", match=MatchValue(value=session_id))
-                    ])
-                )
-                # Apply RRF scoring — rank 1 scores highest
-                for rank, point in enumerate(results.points, start=1):
-                    content = point.payload.get("content", "")
-                    if not content:
-                        continue
-                    topic_id = content.lower().strip()
-                    topic_content[topic_id] = content
-                    rrf_scores[topic_id] = rrf_scores.get(topic_id, 0) + (1.0 / (rank + K))
-            except Exception as e:
-                click.echo(f"⚠️ Multi-search query failed: {e}")
-                continue
-
-        # Sort by RRF score descending and return top results
-        sorted_topics = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
-        return [topic_content[tid] for tid, _ in sorted_topics[:final_limit]]
-
-
-class Neo4jManager:
-    """Manages Neo4j graph database operations"""
-
-    def __init__(self):
-        print("NEO4J_URI:", Config.NEO4J_URI)
-        self.uri = Config.NEO4J_URI
-        self.auth = (Config.NEO4J_USER, Config.NEO4J_PASSWORD)
-        self._setup_constraints()
-
-    def _new_driver(self):
-        return GraphDatabase.driver(
-            self.uri, auth=self.auth,
-            max_connection_lifetime=100, connection_timeout=30,
-        )
-
-    def _get_session(self):
-        return self._new_driver().session()
-
-    def close(self):
-        pass
-
-    def _setup_constraints(self):
-        driver = self._new_driver()
-        try:
-            with driver.session() as session:
-                session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (u:User) REQUIRE u.session_id IS UNIQUE")
-                session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (s:Skill) REQUIRE s.name IS UNIQUE")
-        finally:
-            driver.close()
-
-    def create_user_session(self, session_id: str, resume_data: Dict[str, Any]):
-        driver = self._new_driver()
-        try:
-            with driver.session() as session:
-                session.run(
-                    "CREATE (u:User {session_id: $session_id, created_at: datetime()})",
-                    session_id=session_id
-                )
-                for skill in resume_data.get("skills", []):
-                    session.run("""
-                        MERGE (s:Skill {name: $skill})
-                        WITH s
-                        MATCH (u:User {session_id: $session_id})
-                        CREATE (u)-[:HAS_SKILL {proficiency: 0.7}]->(s)
-                    """, skill=skill, session_id=session_id)
-        finally:
-            driver.close()
-
-    def create_jd_requirements(self, session_id: str, jd_requirements: Dict[str, Any]):
-        driver = self._new_driver()
-        try:
-            with driver.session() as session:
-                for skill in jd_requirements.get("required_skills", []):
-                    session.run("""
-                        MERGE (s:Skill {name: $skill})
-                        WITH s
-                        MATCH (u:User {session_id: $session_id})
-                        MERGE (r:Requirement {session_id: $session_id, skill: $skill, priority: 'high'})
-                        CREATE (r)-[:REQUIRES]->(s)
-                        CREATE (u)-[:TARGETS]->(r)
-                    """, skill=skill, session_id=session_id)
-        finally:
-            driver.close()
-
-    def store_qa_evaluation(self, session_id: str, qa_data: Dict[str, Any]):
-        driver = self._new_driver()
-        try:
-            with driver.session() as session:
-                session.run("""
-                    MATCH (u:User {session_id: $session_id})
-                    CREATE (q:Question {id: $qa_id, text: $question, asked_at: datetime()})
-                    CREATE (a:Answer {
-                        text: $answer,
-                        technical_score: $technical_score,
-                        clarity_score: $clarity_score,
-                        confidence_score: $confidence_score,
-                        overall_score: $overall_score
-                    })
-                    CREATE (u)-[:ASKED]->(q)
-                    CREATE (q)-[:ANSWERED_BY]->(a)
-                """,
-                    session_id=session_id,
-                    qa_id=qa_data["question_id"],
-                    question=qa_data["question"],
-                    answer=qa_data["answer"],
-                    technical_score=qa_data["technical_score"],
-                    clarity_score=qa_data["clarity_score"],
-                    confidence_score=qa_data["confidence_score"],
-                    overall_score=qa_data["overall_score"]
-                )
-                if qa_data["overall_score"] < 3.0:
-                    weakness_area = qa_data.get("question", "Unknown topic")[:200]
-                    score = qa_data["overall_score"]
-                    if score <= 1.0:
-                        recommendation = f"No answer provided. Study this topic from scratch: '{weakness_area[:80]}'"
-                    elif score < 2.0:
-                        recommendation = f"Very weak answer. Deep dive into: '{weakness_area[:80]}'"
-                    else:
-                        recommendation = f"Partial understanding. Revisit and practice: '{weakness_area[:80]}'"
-                    session.run("""
-                        MATCH (a:Answer)<-[:ANSWERED_BY]-(q:Question {id: $qa_id})
-                        CREATE (w:Weakness {area: $weakness_area, severity: $severity})
-                        CREATE (a)-[:REVEALS]->(w)
-                        CREATE (w)-[:SUGGESTS]->(i:Improvement {recommendation: $recommendation})
-                    """,
-                        qa_id=qa_data["question_id"],
-                        weakness_area=weakness_area,
-                        severity="high" if score < 2.0 else "medium",
-                        recommendation=recommendation
-                    )
-        finally:
-            driver.close()
-
-    def get_performance_summary(self, session_id: str) -> Dict[str, Any]:
-        driver = self._new_driver()
-        try:
-            with driver.session() as session:
-                result = session.run("""
-                    MATCH (u:User {session_id: $session_id})-[:ASKED]->(q:Question)-[:ANSWERED_BY]->(a:Answer)
-                    RETURN
-                        AVG(a.technical_score) as avg_technical,
-                        AVG(a.clarity_score) as avg_clarity,
-                        AVG(a.confidence_score) as avg_confidence,
-                        AVG(a.overall_score) as avg_overall,
-                        COUNT(a) as total_questions
-                """, session_id=session_id)
-                record = result.single()
-                if record:
-                    return {
-                        "avg_technical": round(record["avg_technical"] or 0, 2),
-                        "avg_clarity": round(record["avg_clarity"] or 0, 2),
-                        "avg_confidence": round(record["avg_confidence"] or 0, 2),
-                        "avg_overall": round(record["avg_overall"] or 0, 2),
-                        "total_questions": record["total_questions"]
-                    }
-                return {}
-        finally:
-            driver.close()
-
-    def get_weaknesses_and_improvements(self, session_id: str) -> List[Dict[str, str]]:
-        driver = self._new_driver()
-        try:
-            with driver.session() as session:
-                result = session.run("""
-                    MATCH (u:User {session_id: $session_id})-[:ASKED]->(:Question)-[:ANSWERED_BY]->(:Answer)-[:REVEALS]->(w:Weakness)
-                    MATCH (w)-[:SUGGESTS]->(i:Improvement)
-                    RETURN w.area as weakness, w.severity as severity, i.recommendation as improvement
-                    ORDER BY w.severity DESC
-                """, session_id=session_id)
-                return [
-                    {"weakness": r["weakness"], "severity": r["severity"], "improvement": r["improvement"]}
-                    for r in result
-                ]
-        finally:
-            driver.close()
 
 # ===================================================================
 # PARSERS
@@ -492,8 +180,8 @@ class InterviewEngine:
             openai_api_key=key,
             temperature=0.7
         )
-        self.qdrant = QdrantManager(openai_api_key=key)
-        self.neo4j = Neo4jManager()
+        self.qdrant = PineconeManager(openai_api_key=key)
+        self.neo4j = KuzuManager()
         self.resume_parser = ResumeParser(self.llm)
         self.jd_parser = JDParser(self.llm)
         self.graph = self._build_graph()
@@ -1133,20 +821,19 @@ def main(mode: str, resume: str, jd: str):
 
 @click.command()
 def setup():
-    """Initialize Qdrant and Neo4j databases"""
+    """Initialize Pinecone index and KuzuDB schema"""
     click.echo("🔧 Setting up databases...\n")
     try:
-        qdrant = QdrantManager()
-        click.echo("✓ Qdrant connected and collections created")
+        PineconeManager()
+        click.echo("✓ Pinecone index ready")
     except Exception as e:
-        click.echo(f"❌ Qdrant error: {e}")
+        click.echo(f"❌ Pinecone error: {e}")
         return
     try:
-        neo4j = Neo4jManager()
-        click.echo("✓ Neo4j connected and constraints created")
-        neo4j.close()
+        KuzuManager()
+        click.echo("✓ KuzuDB schema initialized")
     except Exception as e:
-        click.echo(f"❌ Neo4j error: {e}")
+        click.echo(f"❌ KuzuDB error: {e}")
         return
     click.echo("\n✅ All databases initialized successfully!")
 

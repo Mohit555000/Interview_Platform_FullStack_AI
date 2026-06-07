@@ -4,3 +4,5 @@ backend/venv
 backend/.venv
 backend/.env
 *.pdf
+backend/kuzu_data
+backend/kuzu_data.wal
