@@ -276,7 +276,8 @@ async def start_session(
 
         session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
 
-        engine = InterviewEngine()
+        openai_key = llm_api_key if (llm_provider or 'openai').lower() == 'openai' else None
+        engine = InterviewEngine(openai_api_key=openai_key)
         inject_llm(engine, llm_provider or 'openai', llm_model or '', llm_api_key or '')
 
         resume_text = engine.resume_parser.extract_text_from_pdf(resume_path)

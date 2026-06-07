@@ -128,7 +128,7 @@ class InterviewState(TypedDict):
 class QdrantManager:
     """Manages Qdrant vector database operations"""
 
-    def __init__(self):
+    def __init__(self, openai_api_key: str = None):
         self.client = QdrantClient(
             url=Config.QDRANT_HOST,
             api_key=Config.QDRANT_API_KEY,
@@ -136,7 +136,7 @@ class QdrantManager:
         )
         self.embeddings = OpenAIEmbeddings(
             model=Config.EMBEDDING_MODEL,
-            openai_api_key=Config.OPENAI_API_KEY
+            openai_api_key=openai_api_key or Config.OPENAI_API_KEY
         )
         self._setup_collections()
 
@@ -485,13 +485,14 @@ class JDParser:
 class InterviewEngine:
     """Main interview orchestration using LangGraph"""
 
-    def __init__(self):
+    def __init__(self, openai_api_key: str = None):
+        key = openai_api_key or Config.OPENAI_API_KEY
         self.llm = ChatOpenAI(
             model=Config.LLM_MODEL,
-            openai_api_key=Config.OPENAI_API_KEY,
+            openai_api_key=key,
             temperature=0.7
         )
-        self.qdrant = QdrantManager()
+        self.qdrant = QdrantManager(openai_api_key=key)
         self.neo4j = Neo4jManager()
         self.resume_parser = ResumeParser(self.llm)
         self.jd_parser = JDParser(self.llm)
