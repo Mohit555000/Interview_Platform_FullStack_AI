@@ -178,15 +178,26 @@ async def text_to_speech(body: TTSRequest):
 async def transcribe_audio(session_id: str, audio: UploadFile = File(...)):
     """
     Transcribe audio blob using Google Speech Recognition.
-    Accepts WebM audio from MediaRecorder, converts to WAV, transcribes.
+    Accepts WebM audio from MediaRecorder, converts to WAV via pydub (requires ffmpeg).
     """
+    import traceback
+    import shutil
     import speech_recognition as sr
+    import speech_recognition.audio as sr_audio
     from pydub import AudioSegment
+    from pydub.utils import which
+
+    # Explicitly set ffmpeg path for pydub (Homebrew on Apple Silicon)
+    AudioSegment.converter = which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
+    AudioSegment.ffprobe   = which("ffprobe") or "/opt/homebrew/bin/ffprobe"
+
+    # Override bundled x86 flac-mac with Homebrew ARM64 native binary
+    system_flac = shutil.which("flac") or "/opt/homebrew/bin/flac"
+    sr_audio.get_flac_converter = lambda: system_flac
 
     if session_id not in sessions:
         raise HTTPException(404, "Session not found")
 
-    # Save uploaded audio to temp file
     suffix = os.path.splitext(audio.filename)[1] or ".webm"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         content = await audio.read()
@@ -200,7 +211,7 @@ async def transcribe_audio(session_id: str, audio: UploadFile = File(...)):
         audio_seg = audio_seg.set_channels(1).set_frame_rate(16000)
         audio_seg.export(wav_path, format="wav")
 
-        # Transcribe with Google Speech Recognition
+        # Transcribe with Google Speech Recognition (free)
         recognizer = sr.Recognizer()
         with sr.AudioFile(wav_path) as source:
             audio_data = recognizer.record(source)
@@ -213,6 +224,8 @@ async def transcribe_audio(session_id: str, audio: UploadFile = File(...)):
     except sr.RequestError as e:
         raise HTTPException(503, f"Google Speech Recognition unavailable: {e}")
     except Exception as e:
+        print(f"[TRANSCRIBE ERROR] {type(e).__name__}: {e}")
+        traceback.print_exc()
         raise HTTPException(500, f"Transcription error: {str(e)}")
     finally:
         os.unlink(tmp_path)
@@ -355,7 +368,6 @@ def submit_answer(session_id: str, body: AnswerRequest):
     state["current_answer_cleaned"] = None
     state["current_answer_enhanced"] = None
 
-    state = engine.clean_response_node(state)
     state = engine.enhance_answer_node(state)   # ← semantic normalization
     state = engine.evaluate_answer_node(state)
     state = engine.adaptation_node(state)

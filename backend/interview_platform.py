@@ -130,7 +130,7 @@ class QdrantManager:
 
     def __init__(self):
         self.client = QdrantClient(
-            url=f"https://{Config.QDRANT_HOST}",
+            url=Config.QDRANT_HOST,
             api_key=Config.QDRANT_API_KEY,
             timeout=60
         )
