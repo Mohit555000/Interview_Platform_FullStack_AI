@@ -108,7 +108,7 @@ class ReportResponse(BaseModel):
 
 class TTSRequest(BaseModel):
     text: str
-    api_key: str
+    session_id: str
 
 
 # ── CLEANUP ───────────────────────────────────────────────────────
@@ -156,7 +156,10 @@ async def text_to_speech(body: TTSRequest):
     Returns MP3 audio stream.
     """
     from openai import OpenAI
-    client = OpenAI(api_key=body.api_key)
+    sess = sessions.get(body.session_id)
+    if not sess:
+        raise HTTPException(404, "Session not found")
+    client = OpenAI(api_key=sess["llm_api_key"])
 
     response = client.audio.speech.create(
         model="gpt-4o-mini-tts",
@@ -321,6 +324,7 @@ async def start_session(
             "duration": duration,
             "llm_provider": llm_provider or 'openai',
             "llm_model": llm_model or '',
+            "llm_api_key": llm_api_key or '',
         }
 
         return StartSessionResponse(

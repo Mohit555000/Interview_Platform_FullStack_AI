@@ -100,7 +100,7 @@ export default function InterviewRun() {
     if (!isMountedRef.current) return   // ← don't speak if unmounted
     setAiStateSynced('speaking')
     try {
-      const audioBlob = await speakText(text)
+      const audioBlob = await speakText(text, sessionRef.current?.session_id)
       if (!isMountedRef.current) return  // ← check again after async call
       const url = URL.createObjectURL(audioBlob)
       await new Promise((resolve) => {
