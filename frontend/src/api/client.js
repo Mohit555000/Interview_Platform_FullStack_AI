@@ -74,6 +74,8 @@ export const transcribeAudio = async (sessionId, audioBlob) => {
  * TTS: send text → backend returns MP3 audio blob (OpenAI fable voice)
  */
 export const speakText = async (text) => {
-  const response = await api.post('/tts', { text }, { responseType: 'blob' })
+  const raw = sessionStorage.getItem('llmConfig')
+  const config = raw ? JSON.parse(raw) : {}
+  const response = await api.post('/tts', { text, api_key: config.apiKey || '' }, { responseType: 'blob' })
   return response.data  // audio/mpeg blob
 }

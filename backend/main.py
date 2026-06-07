@@ -108,6 +108,7 @@ class ReportResponse(BaseModel):
 
 class TTSRequest(BaseModel):
     text: str
+    api_key: str
 
 
 # ── CLEANUP ───────────────────────────────────────────────────────
@@ -155,7 +156,7 @@ async def text_to_speech(body: TTSRequest):
     Returns MP3 audio stream.
     """
     from openai import OpenAI
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    client = OpenAI(api_key=body.api_key)
 
     response = client.audio.speech.create(
         model="gpt-4o-mini-tts",
@@ -186,13 +187,16 @@ async def transcribe_audio(session_id: str, audio: UploadFile = File(...)):
     from pydub import AudioSegment
     from pydub.utils import which
 
-    # Explicitly set ffmpeg path for pydub (Homebrew on Apple Silicon)
-    AudioSegment.converter = which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
-    AudioSegment.ffprobe   = which("ffprobe") or "/opt/homebrew/bin/ffprobe"
+    ffmpeg_path = which("ffmpeg")
+    if ffmpeg_path:
+        AudioSegment.converter = ffmpeg_path
+    ffprobe_path = which("ffprobe")
+    if ffprobe_path:
+        AudioSegment.ffprobe = ffprobe_path
 
-    # Override bundled x86 flac-mac with Homebrew ARM64 native binary
-    system_flac = shutil.which("flac") or "/opt/homebrew/bin/flac"
-    sr_audio.get_flac_converter = lambda: system_flac
+    system_flac = shutil.which("flac")
+    if system_flac:
+        sr_audio.get_flac_converter = lambda: system_flac
 
     if session_id not in sessions:
         raise HTTPException(404, "Session not found")
