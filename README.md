@@ -1,5 +1,3 @@
-Here's the complete LinkedIn post:
-
 🎙️ I built an AI-powered Mock Interview Platform — and here's everything I learned building it.
 The best way to crack an interview is practice. Not theory. Not LeetCode. Actually sitting in front of someone and answering questions out loud, under pressure, in real time.
 But getting that practice is expensive. Seniors are busy. Paid platforms charge ₹500–₹2000 per session. Peer practice gives you no real feedback. And talking to yourself tells you nothing about whether your answer was actually correct.
